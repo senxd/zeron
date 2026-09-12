@@ -1414,6 +1414,55 @@ impl Pickers {
         cx.notify();
     }
 
+    /// Apply a loadout slot to the current composer. New chats take the full
+    /// config; an existing chat only accepts the same harness.
+    pub fn apply_loadout_slot(
+        &mut self,
+        slot: &crate::settings::LoadoutSlot,
+        cx: &mut Context<Self>,
+    ) -> Result<(), crate::settings::ApplyLoadoutError> {
+        let chat_exists = self.harness_locked(cx);
+        let current = if chat_exists {
+            self.state
+                .read(cx)
+                .selected_chat_row()
+                .and_then(|chat| chat.config.as_ref().map(|config| config.harness))
+                .or_else(|| self.effective_harness(cx))
+        } else {
+            None
+        };
+        crate::settings::apply_loadout_gate(chat_exists, current, Some(slot))?;
+        if chat_exists {
+            self.pick_model(slot.model.clone(), cx);
+            if let Some(level) = slot.reasoning {
+                self.pick_reasoning(level, cx);
+            }
+            let options = slot.model_options.clone();
+            self.update_chat_config(cx, move |config| {
+                config.model_options = options;
+            });
+        } else {
+            self.config.harness = Some(slot.harness);
+            self.config.model = Some(slot.model.clone());
+            self.config.reasoning = slot.reasoning;
+            self.config.model_options = slot.model_options.clone();
+            self.defaults.harness = Some(slot.harness);
+            self.defaults.remember_model(
+                slot.harness,
+                slot.model.clone(),
+                slot.label.clone(),
+            );
+            if let Some(level) = slot.reasoning {
+                self.defaults.reasoning = Some(level);
+            }
+            self.save_defaults();
+            self.ensure_models(slot.harness, false, cx);
+            self.active = self.selected_model_index(cx);
+        }
+        cx.notify();
+        Ok(())
+    }
+
     /// Apply `change` to the selected chat's effective config and persist it:
     /// optimistic row stamp (chips update on click) + `Mutate setChatConfig`
     /// (LWW workspace write — restarts and other devices see it). The written

@@ -21,9 +21,16 @@ pub mod composer;
 pub mod devices;
 pub mod files;
 pub mod harnesses;
+pub mod loadout_model;
+pub mod loadout;
 pub mod notifications;
 pub mod shortcuts;
 pub mod widgets;
+
+pub use loadout_model::{
+    ApplyLoadoutError, DEFAULT_LOADOUT_PREFIX, LOADOUT_SLOTS, LoadoutConfig, LoadoutSlot,
+    apply_loadout_error_message, apply_loadout_gate, loadout_combo,
+};
 
 /// Sidebar drag-resize bounds (px).
 pub const SIDEBAR_MIN: f32 = 208.0;
@@ -399,6 +406,8 @@ pub struct UiSettings {
     pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
+    /// Composer loadout slots and the shared Cmd+Shift activation prefix.
+    pub loadout: LoadoutConfig,
     /// Whether bare Escape stops the active agent after contextual consumers
     /// decline it. Device-local and opt-in.
     pub escape_stops_active_agent: bool,
@@ -470,6 +479,7 @@ impl Default for UiSettings {
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
+            loadout: LoadoutConfig::default(),
             escape_stops_active_agent: false,
             composer_send_behavior: ComposerSendBehavior::default(),
             appearance: crate::appearance::AppearanceMode::default(),
@@ -937,6 +947,7 @@ impl UiSettings {
         self.ui_font_size = self.ui_font_size.normalized();
         self.keymap.heal_jump_slots();
         self.keymap.heal_reserved_composer_shortcuts();
+        self.loadout = self.loadout.clamped();
         self
     }
 
@@ -1120,6 +1131,7 @@ mod tests {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
             },
+            loadout: LoadoutConfig::default(),
             escape_stops_active_agent: true,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             appearance: crate::appearance::AppearanceMode::Light,

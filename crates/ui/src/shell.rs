@@ -41,14 +41,17 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
+use crate::settings::loadout::{LoadoutEvent, LoadoutPage};
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    self, CHAT_PANEL_MIN, ComposerSendBehavior, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT,
-    RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
-    SidebarOrganization, SidebarSort, TERMINAL_DEFAULT_HEIGHT, UiSettings, badge_combo,
-    jump_hints_visible, modifier_send_hint_visible, platform_combo,
+    self, CHAT_PANEL_MIN, ComposerSendBehavior, DEFAULT_LOADOUT_PREFIX, JUMP_SLOTS, KeymapConfig,
+    LOADOUT_SLOTS, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN,
+    SavePolicy, ShortcutId, SidebarOrganization, SidebarSort, TERMINAL_DEFAULT_HEIGHT, UiSettings,
+    apply_loadout_error_message, badge_combo, jump_hints_visible, loadout_combo,
+    modifier_send_hint_visible, platform_combo,
 };
+use crate::toast::{self, Toast, ToastKind};
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
     format_time_ago, org_name_valid, parse_orgs, sort_memberships,
@@ -203,6 +206,11 @@ fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f
 #[action(namespace = shell, no_json)]
 pub struct JumpSession(pub usize);
 
+/// Activate loadout slot `n` (zero-based) via the shared prefix + 1–N.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = shell, no_json)]
+pub struct ActivateLoadout(pub usize);
+
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
 // ---------------------------------------------------------------------------
@@ -290,6 +298,8 @@ pub fn apply_keymap(
     cx: &mut App,
     keymap: &KeymapConfig,
     composer_send_behavior: ComposerSendBehavior,
+    loadout_prefix: &str,
+    bind_loadout: bool,
 ) {
     fn valid_or_default(combo: &str, fallback: &str) -> String {
         let candidate = platform_combo(combo);
@@ -377,6 +387,24 @@ pub fn apply_keymap(
             None,
         ))
     }));
+    let prefix = if crate::settings::loadout_model::prefix_is_valid(loadout_prefix) {
+        loadout_prefix
+    } else {
+        DEFAULT_LOADOUT_PREFIX
+    };
+    if bind_loadout
+        && crate::settings::loadout_model::loadout_prefix_conflict(keymap, prefix).is_none()
+    {
+        cx.bind_keys((0..LOADOUT_SLOTS).filter_map(|slot| {
+            let combo = loadout_combo(prefix, slot);
+            let candidate = platform_combo(&combo);
+            if Keystroke::parse(&candidate).is_ok() {
+                Some(KeyBinding::new(&candidate, ActivateLoadout(slot), None))
+            } else {
+                None
+            }
+        }));
+    }
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
@@ -385,6 +413,8 @@ pub enum SettingsSection {
     Devices,
     /// Which harnesses the composer offers (enable/disable toggles).
     Harnesses,
+    /// Five-slot composer loadout (drag models, Cmd+Shift+1–N).
+    Loadout,
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
     Appearance,
@@ -395,9 +425,10 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 8] = [
+    pub const ALL: [SettingsSection; 9] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
+        SettingsSection::Loadout,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Files,
@@ -412,6 +443,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Devices => "Devices",
             SettingsSection::Harnesses => "Agents",
+            SettingsSection::Loadout => "Default models",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
@@ -1248,6 +1280,12 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
+    loadout_page: Option<Entity<LoadoutPage>>,
+    loadout_sub: Option<Subscription>,
+    loadout_recording: bool,
+    toast: Option<Toast>,
+    toast_seq: u64,
+    toast_task: Option<Task<()>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
@@ -1486,7 +1524,13 @@ impl Shell {
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
         });
         // Bind the customizable shortcuts from the persisted keymap.
-        apply_keymap(cx, &settings.keymap, settings.composer_send_behavior);
+        apply_keymap(
+            cx,
+            &settings.keymap,
+            settings.composer_send_behavior,
+            &settings.loadout.prefix,
+            true,
+        );
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
         // synthetic input can't reach them on headless compositors.
@@ -1496,6 +1540,9 @@ impl Shell {
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
+            Some("settings/models") | Some("settings/loadout") => {
+                Route::Settings(SettingsSection::Loadout)
+            }
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
@@ -1589,6 +1636,12 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
+            loadout_page: None,
+            loadout_sub: None,
+            loadout_recording: false,
+            toast: None,
+            toast_seq: 0,
+            toast_task: None,
             shortcuts_sub: None,
             notifications_sub: None,
             files_settings_sub: None,
@@ -3177,6 +3230,14 @@ impl Shell {
         if section == SettingsSection::Harnesses {
             self.harnesses_page = None;
         }
+        if section != SettingsSection::Loadout && self.loadout_recording {
+            self.loadout_recording = false;
+            self.rebind_keys(cx);
+        }
+        if section == SettingsSection::Loadout {
+            self.loadout_page = None;
+            self.loadout_sub = None;
+        }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
         self.close_user_menu(cx);
@@ -3185,6 +3246,10 @@ impl Shell {
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if self.loadout_recording {
+            self.loadout_recording = false;
+            self.rebind_keys(cx);
+        }
         self.route = Route::Chat;
         self.focus_composer(cx);
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
@@ -3251,6 +3316,41 @@ impl Shell {
                     self.harnesses_page = Some(cx.new(|cx| HarnessesPage::new(state, cx)));
                 }
                 match &self.harnesses_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Loadout => {
+                if self.loadout_page.is_none() {
+                    let state = self.state.clone();
+                    let loadout = self.settings.loadout.clone();
+                    let keymap = self.settings.keymap.clone();
+                    let page = cx.new(|cx| LoadoutPage::new(state, loadout, keymap, cx));
+                    self.loadout_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &LoadoutEvent, cx| match event {
+                            LoadoutEvent::Changed(loadout) => {
+                                this.settings.loadout = loadout.clone();
+                                this.rebind_keys(cx);
+                                this.schedule_save(cx);
+                                cx.notify();
+                            }
+                            LoadoutEvent::RecordingChanged(recording) => {
+                                this.loadout_recording = *recording;
+                                this.rebind_keys(cx);
+                                cx.notify();
+                            }
+                            LoadoutEvent::OpenAgents => {
+                                this.open_settings(SettingsSection::Harnesses, cx);
+                            }
+                        },
+                    ));
+                    self.loadout_page = Some(page);
+                } else if let Some(page) = &self.loadout_page {
+                    let keymap = self.settings.keymap.clone();
+                    page.update(cx, |page, cx| page.set_keymap(keymap, cx));
+                }
+                match &self.loadout_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -3399,6 +3499,8 @@ impl Shell {
                                 cx,
                                 &this.settings.keymap,
                                 this.settings.composer_send_behavior,
+                                &this.settings.loadout.prefix,
+                                !this.loadout_recording,
                             );
                             this.schedule_save(cx);
                             cx.notify();
@@ -3539,6 +3641,99 @@ impl Shell {
     /// stranding it over a session the user never picked.
     pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
         self.add_space.is_some() || self.composer.read(cx).pickers().read(cx).is_open()
+    }
+
+    fn rebind_keys(&self, cx: &mut App) {
+        apply_keymap(
+            cx,
+            &self.settings.keymap,
+            self.settings.composer_send_behavior,
+            &self.settings.loadout.prefix,
+            !self.loadout_recording,
+        );
+    }
+
+    fn push_toast(
+        &mut self,
+        kind: ToastKind,
+        message: impl Into<gpui::SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.toast_seq += 1;
+        let id = self.toast_seq;
+        self.toast = Some(Toast::new(id, kind, message));
+        self.toast_task = Some(toast::dismiss_after(
+            id,
+            cx,
+            move |this| {
+                let Some(toast) = this.toast.as_mut() else {
+                    return false;
+                };
+                if toast.id != id {
+                    return false;
+                }
+                toast.begin_close();
+                true
+            },
+            move |this| {
+                if this.toast.as_ref().is_some_and(|toast| toast.id == id) {
+                    this.toast = None;
+                }
+            },
+        ));
+        cx.notify();
+    }
+
+    fn activate_loadout(&mut self, slot: usize, cx: &mut Context<Self>) {
+        if self.loadout_recording {
+            return;
+        }
+        let Some(slot) = self.settings.loadout.slot(slot).cloned() else {
+            self.push_toast(ToastKind::Warning, "That loadout slot is empty.", cx);
+            return;
+        };
+        let result = self.composer.update(cx, |composer, cx| {
+            composer
+                .pickers()
+                .update(cx, |pickers, cx| pickers.apply_loadout_slot(&slot, cx))
+        });
+        if let Err(error) = result {
+            self.push_toast(ToastKind::Error, apply_loadout_error_message(&error), cx);
+        }
+    }
+
+    fn render_toast_overlay(
+        &mut self,
+        sidebar: f32,
+        right: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(toast) = self.toast.clone() else {
+            return Empty.into_any_element();
+        };
+        if toast.is_finished() {
+            self.toast = None;
+            return Empty.into_any_element();
+        }
+        let theme = Theme::of(cx).clone();
+        let entity = cx.entity();
+        div()
+            .absolute()
+            .top(px(Theme::TITLEBAR_HEIGHT + 10.0))
+            .left(px(sidebar))
+            .right(px(right))
+            .flex()
+            .justify_center()
+            .occlude()
+            .child(toast::render_toast(&toast, &theme, move |_, _, cx| {
+                entity.update(cx, |this, cx| {
+                    if let Some(toast) = this.toast.as_mut() {
+                        toast.begin_close();
+                    }
+                    cx.notify();
+                });
+            }))
+            .into_any_element()
     }
 
     /// Track held modifiers for sidebar jump hints and the queue's submit hint.
@@ -4673,6 +4868,7 @@ impl Shell {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Harnesses => icons::WIDGET,
+            SettingsSection::Loadout => icons::STAR,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER,
@@ -8805,6 +9001,9 @@ impl Render for Shell {
                     this.jump_to_session(jump.0, cx)
                 }
             }))
+            .on_action(cx.listener(|this, action: &ActivateLoadout, _, cx| {
+                this.activate_loadout(action.0, cx);
+            }))
             .on_modifiers_changed(
                 cx.listener(|this, event, _, cx| this.on_modifiers_changed(event, cx)),
             )
@@ -9021,7 +9220,16 @@ impl Render for Shell {
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
                     .child(self.render_titlebar_cluster(cx))
-                    .children(overlays);
+                    .children(overlays)
+                    .child(self.render_toast_overlay(
+                        sidebar_now,
+                        if right_open {
+                            self.eval_tween(self.right_tween, self.right_target(cx))
+                        } else {
+                            0.0
+                        },
+                        cx,
+                    ));
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
             }
