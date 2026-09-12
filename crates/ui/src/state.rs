@@ -637,6 +637,11 @@ pub struct AppState {
     /// empty transcript is otherwise indistinguishable from the pre-replay
     /// gap after selection, where optimistic echoes may already be visible.
     pub transcript_replayed: bool,
+    /// The selected chat's opening `WatchQueue` reset frame has landed. Before
+    /// this, an empty `queue` merely means we haven't heard back from the host
+    /// yet — not that the queue is actually empty. The composer uses this to
+    /// avoid prematurely clearing an in-flight queue edit.
+    pub queue_replayed: bool,
     /// Changes only when transcript/optimistic content changes. Presence,
     /// catalogs and other app-state notifications need no row derivation.
     pub(crate) transcript_revision: u64,
@@ -672,6 +677,7 @@ pub struct AppState {
     change_requests: ChangeRequestClientState,
     change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
     queue_task: Option<Task<()>>,
+    queue_watch_generation: u64,
     change_requests_visible: bool,
     /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
     /// subagent tabs read these). Independent of `selected_chat`: a tab's
@@ -726,6 +732,7 @@ impl AppState {
             queue: Vec::new(),
             context_usage: None,
             transcript_replayed: false,
+            queue_replayed: false,
             transcript_revision: 0,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
@@ -742,6 +749,7 @@ impl AppState {
             change_requests: ChangeRequestClientState::default(),
             change_request_tasks: HashMap::new(),
             queue_task: None,
+            queue_watch_generation: 0,
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
@@ -856,7 +864,9 @@ impl AppState {
             self.transcript_replayed = false;
             self.transcript_task = None;
             self.queue.clear();
+            self.queue_replayed = false;
             self.queue_task = None;
+            self.queue_watch_generation = self.queue_watch_generation.wrapping_add(1);
         }
     }
 
@@ -1619,6 +1629,10 @@ impl AppState {
         self.context_usage = None;
         self.transcript_revision = self.transcript_revision.wrapping_add(1);
         self.transcript_replayed = false;
+        self.queue.clear();
+        self.queue_replayed = false;
+        self.queue_task = None;
+        self.queue_watch_generation = self.queue_watch_generation.wrapping_add(1);
         self.echoes.clear();
         self.pending_sends.clear();
         self.upload_progress = None;
@@ -1740,7 +1754,13 @@ impl AppState {
                 .engine_info()
                 .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
             {
-                self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+                self.queue_watch_generation = self.queue_watch_generation.wrapping_add(1);
+                self.queue_task = Some(spawn_queue_watch(
+                    cx,
+                    handle,
+                    chat_id,
+                    self.queue_watch_generation,
+                ));
             }
         }
         cx.notify();
@@ -1846,7 +1866,9 @@ impl AppState {
         self.transcript_replayed = false;
         self.transcript_task = None;
         self.queue.clear();
+        self.queue_replayed = false;
         self.queue_task = None;
+        self.queue_watch_generation = self.queue_watch_generation.wrapping_add(1);
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its project (or the lack of one); `select_chat(None)`
             // (the new-session canvas) keeps the current project pick.
@@ -1872,8 +1894,19 @@ impl AppState {
                 .engine_info()
                 .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
             {
-                self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+                self.queue_task = Some(spawn_queue_watch(
+                    cx,
+                    handle,
+                    chat_id,
+                    self.queue_watch_generation,
+                ));
+            } else {
+                // No queue subscription → the queue is trivially replayed.
+                self.queue_replayed = true;
             }
+        } else {
+            // No chat selected or no engine → nothing to replay.
+            self.queue_replayed = true;
         }
         cx.notify();
     }
@@ -1884,6 +1917,7 @@ impl AppState {
     /// document itself did not change and therefore emitted no new frame.
     pub(crate) fn refresh_selected_queue(&mut self, cx: &mut Context<Self>) {
         self.queue_task = None;
+        self.queue_watch_generation = self.queue_watch_generation.wrapping_add(1);
         let (Some(chat_id), Some(handle)) = (self.selected_chat.clone(), self.engine.clone())
         else {
             return;
@@ -1892,7 +1926,12 @@ impl AppState {
             .engine_info()
             .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
         {
-            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+            self.queue_task = Some(spawn_queue_watch(
+                cx,
+                handle,
+                chat_id,
+                self.queue_watch_generation,
+            ));
         }
     }
 
@@ -2309,10 +2348,20 @@ fn spawn_transcript_watch(
 /// frames (the queue is a handful of rows at most), retried like the transcript
 /// watch — a queue that silently stopped updating would show messages the host
 /// has already sent.
+fn queue_watch_is_current(
+    selected_chat: Option<&str>,
+    watched_chat: &str,
+    current_generation: u64,
+    watch_generation: u64,
+) -> bool {
+    selected_chat == Some(watched_chat) && current_generation == watch_generation
+}
+
 fn spawn_queue_watch(
     cx: &mut Context<AppState>,
     handle: EngineHandle,
     chat_id: String,
+    generation: u64,
 ) -> Task<()> {
     #[derive(serde::Deserialize)]
     struct QueueFrame {
@@ -2348,8 +2397,14 @@ fn spawn_queue_watch(
                 };
                 let alive = this.update(cx, |state, cx| {
                     // Guard against a stale pump racing a newer selection.
-                    if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                    if queue_watch_is_current(
+                        state.selected_chat.as_deref(),
+                        &chat_id,
+                        state.queue_watch_generation,
+                        generation,
+                    ) {
                         state.queue = frame.items;
+                        state.queue_replayed = true;
                         cx.notify();
                     }
                 });
@@ -2445,6 +2500,29 @@ mod tests {
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `zeron_proto::view`.
     use zeron_proto::{SessionStatus, UserProfile};
+
+    #[test]
+    fn stale_queue_watch_cannot_complete_a_new_replay() {
+        assert!(queue_watch_is_current(Some("chat-a"), "chat-a", 2, 2));
+        assert!(!queue_watch_is_current(Some("chat-a"), "chat-a", 2, 1));
+        assert!(!queue_watch_is_current(Some("chat-b"), "chat-a", 2, 2));
+    }
+
+    #[gpui::test]
+    fn selecting_another_chat_invalidates_the_queue_watch(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            state.selected_chat = Some("chat-a".into());
+            state.queue_watch_generation = 7;
+            state.select_chat(Some("chat-b".into()), cx);
+            assert_eq!(state.queue_watch_generation, 8);
+            assert!(state.queue.is_empty());
+            assert!(
+                state.queue_replayed,
+                "no engine means there is no replay to await"
+            );
+        });
+    }
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {

@@ -527,8 +527,12 @@ fn should_publish_optimistic_echo(queue: bool) -> bool {
     !queue
 }
 
-fn begin_interrupt(pending: &mut HashSet<String>, chat_id: &str) -> bool {
+fn begin_chat_action(pending: &mut HashSet<String>, chat_id: &str) -> bool {
     pending.insert(chat_id.to_string())
+}
+
+fn resume_without_user_message_supported(local: bool, host: bool) -> bool {
+    local && host
 }
 
 fn retain_live_interrupts(pending: &mut HashSet<String>, mut is_live: impl FnMut(&str) -> bool) {
@@ -3922,8 +3926,15 @@ fn queue_edit_row_exists_for_visible_chat(
     editing_id: Option<&str>,
     visible_chat_id: &str,
     queue_has_id: bool,
+    queue_replayed: bool,
 ) -> bool {
     if editing_chat_id != Some(visible_chat_id) {
+        return true;
+    }
+    // The queue watch hasn't delivered its opening frame yet — we can't tell
+    // whether the row still exists. Assume it does to avoid a premature
+    // `clear_queue_edit` that would lose the user's edit state.
+    if !queue_replayed {
         return true;
     }
     editing_id.is_none_or(|_| queue_has_id)
@@ -4045,6 +4056,8 @@ pub struct Composer {
     /// another chat's request when the user navigates quickly.
     interrupting: HashSet<String>,
     interrupt_tasks: HashMap<String, Task<()>>,
+    /// Chats whose Resume command is still being queued.
+    resuming: HashSet<String>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -4207,6 +4220,7 @@ impl Composer {
             send_task: None,
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
+            resuming: HashSet::new(),
             editing_queued: None,
             queue_edit_lease_id: None,
             queue_edit_base_text_hash: None,
@@ -5354,6 +5368,7 @@ impl Composer {
                     editing_id
                         .as_ref()
                         .is_some_and(|id| s.queue.iter().any(|item| item.id == *id)),
+                    s.queue_replayed,
                 ),
             )
         };
@@ -6239,6 +6254,23 @@ impl Composer {
         let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
             return;
         };
+        let supported = {
+            let state = self.state.read(cx);
+            let capability = capabilities::RESUME_INTERRUPTED_V1;
+            resume_without_user_message_supported(
+                engine.engine_info().supports(capability),
+                state.chat_host_supports(&chat_id, capability),
+            )
+        };
+        if !supported {
+            self.failure = Some("Update the chat host to resume this turn safely".into());
+            self.failure_key = Some(chat_id);
+            cx.notify();
+            return;
+        }
+        if !begin_chat_action(&mut self.resuming, &chat_id) {
+            return;
+        }
         let resolved = self.pickers.read(cx).resolved(cx);
         let cwd = self
             .state
@@ -6271,13 +6303,15 @@ impl Composer {
         };
         let Ok(command) = serde_json::to_value(&command) else {
             self.failure = Some("Resume failed: could not encode command".into());
-            self.failure_key = Some(chat_id);
+            self.failure_key = Some(chat_id.clone());
+            self.resuming.remove(&chat_id);
             cx.notify();
             return;
         };
         let params = serde_json::json!({ "chatId": chat_id, "command": command });
+        let task_chat = chat_id.clone();
         let failure_chat = chat_id.clone();
-        self.action_task = Some(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = attachments::call_with_timeout(
                 &engine,
                 cx.background_executor(),
@@ -6286,22 +6320,24 @@ impl Composer {
                 std::time::Duration::from_secs(30),
             )
             .await;
-            if let Err(err) = result {
-                this.update(cx, |composer, cx| {
+            this.update(cx, |composer, cx| {
+                composer.resuming.remove(&task_chat);
+                if let Err(err) = result {
                     composer.failure = Some(format!("Resume failed: {err}").into());
                     composer.failure_key = Some(failure_chat);
-                    cx.notify();
-                })
-                .ok();
-            }
-        }));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(crate) fn interrupt_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        if !begin_interrupt(&mut self.interrupting, &chat_id) {
+        if !begin_chat_action(&mut self.interrupting, &chat_id) {
             return;
         }
         let params = interrupt_params(&chat_id);
@@ -8758,27 +8794,112 @@ mod tests {
 
     #[test]
     fn queue_edit_row_stays_present_while_viewing_another_chat() {
+        // Viewing a different chat → edit stays alive regardless.
         assert!(queue_edit_row_exists_for_visible_chat(
             Some("chat-a"),
             Some("queued-1"),
             "chat-b",
             false,
+            true,
         ));
+        // Back on the edit's chat, row missing, queue replayed → gone.
         assert!(!queue_edit_row_exists_for_visible_chat(
             Some("chat-a"),
             Some("queued-1"),
             "chat-a",
             false,
+            true,
         ));
+    }
+
+    #[test]
+    fn queue_edit_row_survives_until_queue_replayed() {
+        // Queue not replayed yet → assume the row exists so we don't
+        // prematurely clear the edit.
+        assert!(queue_edit_row_exists_for_visible_chat(
+            Some("chat-a"),
+            Some("queued-1"),
+            "chat-a",
+            false,
+            false,
+        ));
+        // Once the queue is replayed and the row IS present → exists.
+        assert!(queue_edit_row_exists_for_visible_chat(
+            Some("chat-a"),
+            Some("queued-1"),
+            "chat-a",
+            true,
+            true,
+        ));
+    }
+
+    #[gpui::test]
+    fn queue_edit_mode_and_text_survive_navigation_until_replay(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("chat-a".into());
+            state.queue = vec![zeron_doc::QueuedMessage::new(
+                "queued-1",
+                "original queued text",
+                "device",
+            )];
+            state.queue_replayed = true;
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        composer.update(cx, |composer, cx| {
+            composer.editing_queued = Some("queued-1".into());
+            composer.queue_edit_chat_id = Some("chat-a".into());
+            composer.queue_edit_draft = Some(("ordinary draft".into(), Vec::new()));
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("edited queued text", cx));
+        });
+
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("chat-b".into());
+            state.queue.clear();
+            state.queue_replayed = false;
+        });
+        composer.update(cx, |composer, cx| composer.on_state_changed(cx));
+
+        state.update(cx, |state, _| {
+            state.selected_chat = Some("chat-a".into());
+            state.queue.clear();
+            state.queue_replayed = false;
+        });
+        composer.update(cx, |composer, cx| composer.on_state_changed(cx));
+
+        state.update(cx, |state, _| {
+            state.queue = vec![zeron_doc::QueuedMessage::new(
+                "queued-1",
+                "original queued text",
+                "device",
+            )];
+            state.queue_replayed = true;
+        });
+        composer.update(cx, |composer, cx| composer.on_state_changed(cx));
+
+        composer.read_with(cx, |composer, cx| {
+            assert!(composer.is_editing_current_queue());
+            assert_eq!(composer.editing_queued.as_deref(), Some("queued-1"));
+            assert_eq!(composer.input.read(cx).text(), "edited queued text");
+        });
     }
 
     #[test]
     fn interrupt_tracking_is_idempotent_per_chat() {
         let mut pending = HashSet::new();
-        assert!(begin_interrupt(&mut pending, "chat-a"));
-        assert!(!begin_interrupt(&mut pending, "chat-a"));
-        assert!(begin_interrupt(&mut pending, "chat-b"));
+        assert!(begin_chat_action(&mut pending, "chat-a"));
+        assert!(!begin_chat_action(&mut pending, "chat-a"));
+        assert!(begin_chat_action(&mut pending, "chat-b"));
         assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn resume_requires_hidden_prompt_support_on_both_engines() {
+        assert!(resume_without_user_message_supported(true, true));
+        assert!(!resume_without_user_message_supported(false, true));
+        assert!(!resume_without_user_message_supported(true, false));
     }
 
     #[test]
@@ -8786,7 +8907,7 @@ mod tests {
         let mut pending = HashSet::from(["chat-a".to_string(), "chat-b".to_string()]);
         retain_live_interrupts(&mut pending, |chat_id| chat_id == "chat-b");
         assert_eq!(pending, HashSet::from(["chat-b".to_string()]));
-        assert!(begin_interrupt(&mut pending, "chat-a"));
+        assert!(begin_chat_action(&mut pending, "chat-a"));
     }
 
     #[test]

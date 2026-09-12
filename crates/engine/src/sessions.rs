@@ -354,8 +354,6 @@ impl SessionsEngine {
         if resume_interrupted && request.prompt.trim().is_empty() {
             request.prompt = zeron_proto::RESUME_INTERRUPTED_PROMPT.to_string();
         }
-        // Every dispatched prompt is a turn — routed steer or fresh run alike.
-        self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -365,6 +363,17 @@ impl SessionsEngine {
                 h.routed_steers.clone(),
             )
         });
+        // A duplicate Resume can arrive after its durable QueueCommand ACK but
+        // before the viewer observes Working. The first continuation owns the
+        // turn; restarting it would discard progress.
+        if resume_interrupted
+            && self.turn_in_flight(chat_id)
+            && let Some((run_id, ..)) = &routed
+        {
+            return Ok(run_id.clone());
+        }
+        // Every dispatched prompt is a turn — routed steer or fresh run alike.
+        self.note_turn_start(chat_id, &request.cwd);
         if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
             let user_id = message_id.clone().unwrap_or_else(new_id);
             // Resume is a new harness turn, never a steer into a live run.
@@ -1050,11 +1059,22 @@ impl Inner {
         found
     }
 
-    fn remove_run(&self, chat_id: &str, run_id: &str) {
+    /// Publish a run's settled status before releasing its slot. Dispatch can
+    /// then observe only `(run, active)`, `(run, settled)`, or `(none, settled)`;
+    /// it never starts a replacement that an old teardown can stamp Idle.
+    fn settle_run(
+        &self,
+        chat_id: &str,
+        run_id: &str,
+        status: SessionStatus,
+        completed_turn: Option<String>,
+    ) {
         let mut runs = lock(&self.runs);
-        if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
-            runs.remove(chat_id);
+        if !runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
+            return;
         }
+        self.set_status_with_completion(chat_id, status, false, completed_turn);
+        runs.remove(chat_id);
     }
 }
 
@@ -1391,8 +1411,7 @@ async fn drive_run(
                     session_id: None,
                 },
             );
-            inner.remove_run(&chat_id, &run_id);
-            inner.set_status(&chat_id, SessionStatus::Errored, false);
+            inner.settle_run(&chat_id, &run_id, SessionStatus::Errored, None);
             return;
         }
     };
@@ -2000,7 +2019,7 @@ async fn drive_run(
                 chat = %chat_id,
                 "run died before session start; retrying once (resume kept)"
             );
-            inner.remove_run(&chat_id, &run_id);
+            inner.settle_run(&chat_id, &run_id, SessionStatus::Idle, None);
             let engine = SessionsEngine {
                 inner: inner.clone(),
             };
@@ -2237,8 +2256,7 @@ async fn drive_run(
         .filter(|h| h.run_id == run_id)
         .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
         .unwrap_or_default();
-    inner.remove_run(&chat_id, &run_id);
-    inner.set_status_with_completion(&chat_id, final_status, false, final_completed_turn);
+    inner.settle_run(&chat_id, &run_id, final_status, final_completed_turn);
     if !interrupted && !orphans.is_empty() {
         // The dying run accepted these into its mailbox but never confirmed a
         // Steered boundary (idle-reaper race, a mid-turn error discarding

@@ -528,7 +528,14 @@ async fn interrupt_stamps_streaming_entry_aborted() {
 async fn resume_interrupted_does_not_write_a_user_message() {
     let dir = tempfile::tempdir().unwrap();
     let seen: RequestLog = Arc::new(Mutex::new(Vec::new()));
-    let core = assemble(dir.path(), Arc::new(ResumeHarness { seen: seen.clone() }));
+    let resume_release = Arc::new(tokio::sync::Notify::new());
+    let core = assemble(
+        dir.path(),
+        Arc::new(ResumeHarness {
+            seen: seen.clone(),
+            resume_release: resume_release.clone(),
+        }),
+    );
     let handle = core.doc_host.open(CHAT).unwrap();
     queue_as_viewer(
         handle.doc(),
@@ -564,6 +571,7 @@ async fn resume_interrupted_does_not_write_a_user_message() {
 
     let mut resume = run_request(zeron_proto::RESUME_INTERRUPTED_PROMPT);
     resume.resume_interrupted = true;
+    let duplicate_resume = resume.clone();
     queue_as_viewer(
         handle.doc(),
         "cmd-resume",
@@ -572,6 +580,29 @@ async fn resume_interrupted_does_not_write_a_user_message() {
             message_id: "m-resume".into(),
         },
     );
+    wait_for(|| seen.lock().unwrap().len() == 2, "resumed harness run").await;
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-resume-duplicate",
+        SessionCommandPayload::Run {
+            request: duplicate_resume,
+            message_id: "m-resume-duplicate".into(),
+        },
+    );
+    wait_for(
+        || {
+            command_status(&core, "cmd-resume-duplicate")
+                .is_some_and(|(status, _)| status == SessionCommandStatus::Applied)
+        },
+        "duplicate resume acknowledgement",
+    )
+    .await;
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "duplicate Resume must not restart the continuation"
+    );
+    resume_release.notify_one();
     wait_for(
         || {
             entries(&core).iter().any(|e| {
@@ -604,6 +635,7 @@ type RequestLog = Arc<Mutex<Vec<RunRequest>>>;
 
 struct ResumeHarness {
     seen: RequestLog,
+    resume_release: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait]
@@ -638,6 +670,7 @@ impl Harness for ResumeHarness {
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
         let token = controls.interrupt.clone();
+        let resume_release = self.resume_release.clone();
         tokio::spawn(async move {
             let session = AgentEvent::SessionStarted {
                 harness: HarnessId::Mock,
@@ -662,6 +695,7 @@ impl Harness for ResumeHarness {
                         text: "continued".into(),
                     }))
                     .await;
+                resume_release.notified().await;
                 let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
             }
         });
