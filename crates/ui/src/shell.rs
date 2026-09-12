@@ -1467,7 +1467,10 @@ impl Shell {
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
-            move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+            move |this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+                ComposerEvent::OpenLoadoutSettings => {
+                    this.open_settings(SettingsSection::Loadout, cx)
+                }
                 ComposerEvent::Sent {
                     chat_id,
                     message_id,
@@ -10352,7 +10355,7 @@ mod exit_regressions {
     }
 
     #[gpui::test]
-    fn session_navigation_focuses_composer_once(cx: &mut TestAppContext) {
+    fn composer_routes_loadout_event_and_focuses_once(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             gpui_base::init(cx);
@@ -10390,6 +10393,17 @@ mod exit_regressions {
             cx.open_window(gpui::WindowOptions::default(), |_, _| composer)
                 .unwrap()
         });
+        let pickers = cx.update(|cx| window.read(cx).unwrap().composer.read(cx).pickers().clone());
+        pickers.update(cx, |_, cx| cx.emit(crate::pickers::OpenLoadoutSettings));
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(matches!(
+                    shell.route,
+                    Route::Settings(SettingsSection::Loadout)
+                ));
+                shell.close_settings(cx);
+            })
+            .unwrap();
         for destination in ["initial", "chat", "chat", "new", "new", "back", "settings"] {
             window
                 .update(cx, |shell, _, cx| match destination {

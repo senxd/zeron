@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
@@ -33,6 +33,7 @@ const MAX_REF_ROWS: usize = 300;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion;
+use crate::motion::AnimationExt as _;
 use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
 use crate::state::{AppState, EngineHandle};
@@ -199,12 +200,9 @@ pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
     }
 }
 
-/// The TraitsPicker trigger summary: the effective reasoning level plus every
-/// model option's effective choice — the explicit pick when one is saved and
-/// still offered, else the option's default — joined with " · " ("High · 1M ·
-/// Fast", Cursor's "Agent · Balance"). Defaults are spelled out rather than
-/// hidden so the run's configuration reads without opening the popover; `None`
-/// only when the model has nothing to describe (no ladder, no options).
+/// The TraitsPicker trigger summary: the effective reasoning level plus each
+/// non-speed option's effective choice. Speed is rendered as an icon beside
+/// this text. `None` means the model has nothing textual to describe.
 pub fn traits_summary(
     model: Option<&Model>,
     reasoning: Option<ReasoningLevel>,
@@ -216,6 +214,11 @@ pub fn traits_summary(
     }
     if let Some(model) = model {
         for option in &model.options {
+            if crate::settings::loadout_model::speed_option(model)
+                .is_some_and(|speed| speed.id == option.id)
+            {
+                continue;
+            }
             let choice_id = selections
                 .get(&option.id)
                 .and_then(|v| v.as_str())
@@ -231,6 +234,20 @@ pub fn traits_summary(
     } else {
         Some(parts.join(" · "))
     }
+}
+
+fn effective_speed_enabled(
+    model: Option<&Model>,
+    selections: &serde_json::Map<String, serde_json::Value>,
+) -> Option<bool> {
+    let option = crate::settings::loadout_model::speed_option(model?)?;
+    let fast = crate::settings::loadout_model::speed_choice_id(option)?;
+    let selected = selections
+        .get(&option.id)
+        .and_then(|value| value.as_str())
+        .filter(|id| option.choices.iter().any(|choice| choice.id == *id))
+        .unwrap_or(&option.default_choice);
+    Some(selected == fast)
 }
 
 /// Whether any trait departs from its default — the trigger brightens only
@@ -431,7 +448,33 @@ pub enum PickerKind {
 
 pub(crate) struct ReturnComposerFocus;
 
+pub(crate) struct OpenLoadoutSettings;
+
 impl gpui::EventEmitter<ReturnComposerFocus> for Pickers {}
+impl gpui::EventEmitter<OpenLoadoutSettings> for Pickers {}
+
+#[derive(Clone)]
+struct ReasoningMotion {
+    identity: String,
+    from: f32,
+    to: f32,
+    started: Instant,
+    epoch: u64,
+}
+
+impl ReasoningMotion {
+    fn value(&self, now: Instant) -> f32 {
+        let duration = motion::MODEL_PICKER_CHANGE
+            .total()
+            .mul_f32(motion::speed_scale());
+        if duration.is_zero() {
+            return self.to;
+        }
+        let raw =
+            now.saturating_duration_since(self.started).as_secs_f32() / duration.as_secs_f32();
+        motion::lerp(self.from, self.to, motion::EASE_IN_OUT_CUBIC.eval(raw))
+    }
+}
 
 pub struct Pickers {
     state: Entity<AppState>,
@@ -493,6 +536,7 @@ pub struct Pickers {
     /// Last mid-session switch failure (shown in the ref popover).
     switch_error: Option<String>,
     mutate_task: Option<Task<()>>,
+    reasoning_motion: Option<ReasoningMotion>,
     _search_events: Subscription,
     _state_observe: Subscription,
     _catalog_observe: Subscription,
@@ -638,6 +682,7 @@ impl Pickers {
             switch_task: None,
             switch_error: None,
             mutate_task: None,
+            reasoning_motion: None,
             _search_events: search_events,
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
@@ -2236,6 +2281,7 @@ impl Pickers {
         icon_loading: bool,
         label_loading: bool,
         suffix: Option<(SharedString, Option<gpui::Hsla>)>,
+        speed_enabled: Option<bool>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -2247,6 +2293,12 @@ impl Pickers {
             PickerKind::Device => "picker-device",
         };
         let open = self.open_kind() == Some(kind);
+        let content_id = SharedString::from(format!(
+            "picker-chip-content-{}-{}-{:?}",
+            label,
+            suffix.as_ref().map(|(text, _)| text.as_ref()).unwrap_or(""),
+            speed_enabled
+        ));
         // Ghost pill (zeron composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
         // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
         // hover/open wash — no border, no caret; the actions row stays quiet.
@@ -2264,7 +2316,7 @@ impl Pickers {
             .px(px(10.0))
             .rounded(px(8.0))
             .text_size(crate::typography::ui_rems(12.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
+            .font_weight(gpui::FontWeight::NORMAL)
             // zeron composer/styles.tsx `pill`: `transition-colors` — the wash
             // and text brighten fade over 150ms.
             .text_color(motion::hover_blend(
@@ -2313,22 +2365,39 @@ impl Pickers {
                 el.child(popover::skeleton_bar(56.0, cx.entity_id(), cx))
             })
             .when(!label_loading, |el| {
-                el.child(div().min_w_0().truncate().child(label))
-            })
-            // The effort half of the combined model+effort chip (and the space
-            // chip's "@ device" tag): muted, no icon — one button, two tones.
-            // `tint` overrides the muted tone (the offline warning). Under row
-            // pressure the suffix yields FIRST (large shrink factor) so the
-            // model name — the run's identity — truncates last.
-            .when_some(suffix, |el, (suffix, tint)| {
-                el.child(
-                    div()
-                        .flex_shrink(1000.0)
-                        .min_w_0()
-                        .truncate()
-                        .text_color(tint.unwrap_or(theme.text_muted.opacity(0.7)))
-                        .child(suffix),
-                )
+                let content = div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(div().min_w_0().truncate().child(label))
+                    .when_some(suffix, |content, (suffix, tint)| {
+                        content.child(
+                            div()
+                                .flex_shrink(1000.0)
+                                .min_w_0()
+                                .truncate()
+                                .text_color(tint.unwrap_or(theme.text_muted.opacity(0.7)))
+                                .child(suffix),
+                        )
+                    })
+                    .when_some(speed_enabled, |content, fast| {
+                        content.child(
+                            crate::icons::icon(crate::icons::SPEED)
+                                .flex_none()
+                                .size(px(14.0))
+                                .text_color(if fast {
+                                    theme.warning
+                                } else {
+                                    theme.text_muted
+                                }),
+                        )
+                    });
+                el.child(content.with_animation(
+                    content_id,
+                    motion::MODEL_PICKER_CHANGE.animation(),
+                    |content, t| content.relative().top(px(2.0 * (1.0 - t))).opacity(t),
+                ))
             })
     }
 
@@ -3299,7 +3368,45 @@ impl Pickers {
         } else if searching {
             vec![empty_list_note(&theme, "No models found")]
         } else if loadouts_view {
-            vec![empty_list_note(&theme, "No saved loadouts yet")]
+            vec![
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from("No saved loadouts")),
+                    )
+                    .child(
+                        div()
+                            .id("configure-loadouts")
+                            .h(px(30.0))
+                            .px(px(10.0))
+                            .rounded(px(7.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .bg(crate::theme::ink(0.06))
+                            .hover(|style| style.bg(crate::theme::ink(0.1)))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dismiss(cx);
+                                cx.emit(OpenLoadoutSettings);
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::TUNING)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Configure loadouts")),
+                    )
+                    .into_any_element(),
+            ]
         } else {
             match effective_models {
                 Some(Loadable::Error(message)) => {
@@ -3566,15 +3673,7 @@ impl Pickers {
             .unwrap_or(0);
         let selections = self.explicit_options(cx);
         let speed = crate::settings::loadout_model::speed_option(&model).cloned();
-        let speed_enabled = speed
-            .as_ref()
-            .and_then(crate::settings::loadout_model::speed_choice_id)
-            .is_some_and(|choice| {
-                selections
-                    .get(&speed.as_ref().expect("speed option").id)
-                    .and_then(|value| value.as_str())
-                    == Some(choice)
-            });
+        let speed_enabled = effective_speed_enabled(Some(&model), &selections).unwrap_or(false);
         let reset_enabled = current != default_level || !selections.is_empty();
         let mut sections: Vec<AnyElement> = Vec::new();
         for (opt_ix, option) in model.options.iter().enumerate() {
@@ -3664,7 +3763,7 @@ impl Pickers {
                 crate::icons::icon(crate::icons::SPEED)
                     .size(px(17.0))
                     .text_color(if speed_enabled {
-                        theme.accent
+                        theme.warning
                     } else {
                         theme.text_muted
                     }),
@@ -3687,45 +3786,133 @@ impl Pickers {
                     .size(px(17.0))
                     .text_color(theme.text_muted),
             );
+        let target = if levels.is_empty() {
+            0.0
+        } else {
+            (active_level as f32 + 0.5) / levels.len() as f32
+        };
+        let identity = format!(
+            "{:?}:{}:{:?}:{}",
+            self.effective_harness(cx),
+            model.id,
+            current,
+            levels.len()
+        );
+        let now = Instant::now();
+        if self
+            .reasoning_motion
+            .as_ref()
+            .is_none_or(|motion| motion.identity != identity)
+        {
+            let (from, epoch) = self
+                .reasoning_motion
+                .as_ref()
+                .map(|motion| {
+                    (
+                        if cx.reduce_motion() {
+                            target
+                        } else {
+                            motion.value(now)
+                        },
+                        motion.epoch.wrapping_add(1),
+                    )
+                })
+                .unwrap_or((target, 0));
+            self.reasoning_motion = Some(ReasoningMotion {
+                identity,
+                from,
+                to: target,
+                started: now,
+                epoch,
+            });
+        }
+        let reasoning_motion = self.reasoning_motion.clone().expect("initialized above");
+        let (from, to, epoch) = (
+            reasoning_motion.from,
+            reasoning_motion.to,
+            reasoning_motion.epoch,
+        );
         let meter = (!levels.is_empty()).then(|| {
+            let fill = div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .rounded(px(15.0))
+                .bg(theme.accent.opacity(0.72))
+                .with_animation(
+                    SharedString::from(format!("reasoning-fill-{epoch}")),
+                    motion::MODEL_PICKER_CHANGE.animation(),
+                    move |el, t| el.w(gpui::relative(motion::lerp(from, to, t))),
+                );
+            let thumb = div()
+                .absolute()
+                .top(px(7.0))
+                .size(px(16.0))
+                .ml(px(-8.0))
+                .rounded(px(8.0))
+                .bg(theme.text)
+                .with_animation(
+                    SharedString::from(format!("reasoning-thumb-{epoch}")),
+                    motion::MODEL_PICKER_CHANGE.animation(),
+                    move |el, t| el.left(gpui::relative(motion::lerp(from, to, t))),
+                );
             div()
                 .id("model-reasoning-meter")
+                .relative()
                 .h(px(30.0))
                 .rounded(px(15.0))
                 .overflow_hidden()
                 .bg(crate::theme::ink(0.08))
-                .flex()
-                .children(levels.into_iter().enumerate().map(|(index, level)| {
+                .child(fill)
+                .child(
                     div()
-                        .id(("reasoning-segment", index))
-                        .flex_1()
-                        .h_full()
+                        .absolute()
+                        .inset_0()
                         .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .when(index <= active_level, |el| {
-                            el.bg(theme.accent.opacity(0.72))
-                                .when(index == 0, |el| {
-                                    el.rounded_tl(px(15.0)).rounded_bl(px(15.0))
-                                })
-                                .when(index == active_level, |el| {
-                                    el.rounded_tr(px(15.0)).rounded_br(px(15.0))
-                                })
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| this.pick_reasoning(level, cx)))
-                        .child(
+                        .children((0..levels.len()).map(|index| {
                             div()
-                                .size(px(if index == active_level { 16.0 } else { 6.0 }))
-                                .rounded(px(8.0))
-                                .bg(if index == active_level {
-                                    theme.text
-                                } else {
-                                    theme.text.opacity(0.42)
-                                }),
-                        )
-                }))
+                                .id(("reasoning-dot", index))
+                                .flex_1()
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .size(px(6.0))
+                                        .rounded(px(3.0))
+                                        .bg(theme.text.opacity(0.42)),
+                                )
+                        })),
+                )
+                .child(thumb)
+                .child(div().absolute().inset_0().flex().children(
+                    levels.into_iter().enumerate().map(|(index, level)| {
+                        div()
+                            .id(("reasoning-segment", index))
+                            .flex_1()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.pick_reasoning(level, cx)),
+                            )
+                    }),
+                ))
         });
+        let reasoning_text = div()
+            .text_size(crate::typography::ui_rems(13.0))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(theme.text)
+            .child(reasoning)
+            .with_animation(
+                SharedString::from(format!("reasoning-label-{epoch}")),
+                motion::MODEL_PICKER_CHANGE.animation(),
+                |el, t| el.relative().top(px(2.0 * (1.0 - t))).opacity(t),
+            );
         sections.push(
             div()
                 .id("model-traits-bar")
@@ -3748,13 +3935,7 @@ impl Pickers {
                                 .flex()
                                 .flex_col()
                                 .items_center()
-                                .child(
-                                    div()
-                                        .text_size(crate::typography::ui_rems(13.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.text)
-                                        .child(reasoning),
-                                )
+                                .child(reasoning_text)
                                 .child(
                                     div()
                                         .mt(px(1.0))
@@ -4220,6 +4401,7 @@ impl Render for Pickers {
             &self.trait_ladder(cx),
             &explicit_options,
         );
+        let chip_speed = effective_speed_enabled(self.selected_model(cx), &explicit_options);
         // Render the open popover's body first (mutable borrow), then the
         // chips. Branch/Checkout render in the composer FOOTER row (see
         // `render_footer`), not here.
@@ -4232,11 +4414,18 @@ impl Render for Pickers {
             | Some(PickerKind::Device) => None,
             Some(PickerKind::HarnessModel) => {
                 let content = self.render_harness_model_popover(cx);
+                let frame = self.popover_frame_flush(304.0, content, cx);
                 Some((
                     PickerKind::HarnessModel,
-                    // Compact single-harness pane (t3 ModelPickerContent
-                    // shrunk to its tabbed layout).
-                    self.popover_frame_flush(304.0, content, cx),
+                    div()
+                        .overflow_hidden()
+                        .child(frame)
+                        .with_animation(
+                            "model-picker-height",
+                            motion::MODEL_PICKER_CHANGE.animation(),
+                            |el, t| el.max_h(px(640.0 * t)),
+                        )
+                        .into_any_element(),
                 ))
             }
             None => None,
@@ -4253,12 +4442,8 @@ impl Render for Pickers {
             .items_center()
             .min_w_0()
             .gap(px(4.0));
-        // ONE chip for the whole run identity (user request): brand icon +
-        // model name, then the joined traits summary ("Medium", "High · 1M ·
-        // Fast", "Agent · Balance") as the chip's muted second tone — the
-        // run's configuration reads without opening anything, and the suffix
-        // brightens only when something departs from its default. No suffix
-        // when the model has neither a ladder nor options (e.g. Hermes).
+        // ONE chip for the whole run identity: brand icon + model name, muted
+        // reasoning/options, then the speed icon.
         let chip_suffix = traits_set.map(|summary| {
             (
                 SharedString::from(summary),
@@ -4273,6 +4458,7 @@ impl Render for Pickers {
             chip_icon_loading,
             chip_label_loading,
             chip_suffix,
+            chip_speed,
             &theme,
             cx,
         );
@@ -4674,12 +4860,12 @@ mod tests {
         selections.insert("speed".into(), serde_json::Value::String("fast".into()));
         assert_eq!(
             traits_summary(Some(&model), Some(ReasoningLevel::High), &selections),
-            Some("High · 1M · Fast".to_string())
+            Some("High · 1M".to_string())
         );
         // All defaults: the effective choices still read on the trigger.
         assert_eq!(
             traits_summary(Some(&model), None, &serde_json::Map::new()),
-            Some("Standard · Normal".to_string())
+            Some("Standard".to_string())
         );
         // A saved choice the option no longer offers falls back to the default
         // label rather than vanishing or echoing a stale id.
@@ -4690,7 +4876,17 @@ mod tests {
         );
         assert_eq!(
             traits_summary(Some(&model), None, &stale),
-            Some("Standard · Normal".to_string())
+            Some("Standard".to_string())
+        );
+        assert_eq!(
+            effective_speed_enabled(Some(&model), &serde_json::Map::new()),
+            Some(false)
+        );
+        let mut fast_default = model.clone();
+        fast_default.options[1].default_choice = "fast".into();
+        assert_eq!(
+            effective_speed_enabled(Some(&fast_default), &serde_json::Map::new()),
+            Some(true)
         );
         // Reasoning shows without a model too.
         assert_eq!(
@@ -4740,6 +4936,23 @@ mod tests {
             &ladder,
             &serde_json::Map::new()
         ));
+    }
+
+    #[test]
+    fn reasoning_motion_interpolates_and_settles() {
+        let started = Instant::now();
+        let tween = ReasoningMotion {
+            identity: "cursor:composer:high".into(),
+            from: 0.25,
+            to: 0.75,
+            started,
+            epoch: 1,
+        };
+        assert_eq!(tween.value(started), 0.25);
+        assert_eq!(
+            tween.value(started + motion::MODEL_PICKER_CHANGE.total()),
+            0.75
+        );
     }
 
     #[test]
