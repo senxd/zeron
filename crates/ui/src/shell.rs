@@ -51,13 +51,13 @@ use crate::settings::{
     apply_loadout_error_message, badge_combo, jump_hints_visible, loadout_combo,
     modifier_send_hint_visible, platform_combo,
 };
-use crate::toast::{self, Toast, ToastKind};
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
     format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
+use crate::toast::{self, Toast, ToastKind};
 use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workspace_links::resolve_workspace_file_link;
 
@@ -298,7 +298,7 @@ pub fn apply_keymap(
     cx: &mut App,
     keymap: &KeymapConfig,
     composer_send_behavior: ComposerSendBehavior,
-    loadout_prefix: &str,
+    _loadout_prefix: &str,
     bind_loadout: bool,
 ) {
     fn valid_or_default(combo: &str, fallback: &str) -> String {
@@ -387,14 +387,8 @@ pub fn apply_keymap(
             None,
         ))
     }));
-    let prefix = if crate::settings::loadout_model::prefix_is_valid(loadout_prefix) {
-        loadout_prefix
-    } else {
-        DEFAULT_LOADOUT_PREFIX
-    };
-    if bind_loadout
-        && crate::settings::loadout_model::loadout_prefix_conflict(keymap, prefix).is_none()
-    {
+    let prefix = DEFAULT_LOADOUT_PREFIX;
+    if bind_loadout {
         cx.bind_keys((0..LOADOUT_SLOTS).filter_map(|slot| {
             let combo = loadout_combo(prefix, slot);
             let candidate = platform_combo(&combo);
@@ -8989,15 +8983,15 @@ impl Render for Shell {
                 }
             }))
             // A jump routes back to chat itself, so Settings is not a dead
-            // spot — the same call a click on that sidebar row makes. But an
-            // open picker/palette owns the keyboard: no jumping underneath
-            // it. The MODEL menu advertises these same slots on its rows and
-            // this matched binding beats its key handler to the dispatch —
-            // forward the slot instead of eating it.
+            // spot. The model menu preserves these existing chat shortcuts;
+            // other overlays keep ownership of the keyboard.
             .on_action(cx.listener(|this, jump: &JumpSession, _, cx| {
                 let pickers = this.composer.read(cx).pickers().clone();
-                let handled = pickers.update(cx, |pickers, cx| pickers.jump_model_slot(jump.0, cx));
-                if !handled && !this.overlay_owns_keyboard(cx) {
+                let model_menu_open = pickers.read(cx).is_model_menu_open();
+                if model_menu_open || !this.overlay_owns_keyboard(cx) {
+                    if model_menu_open {
+                        pickers.update(cx, |pickers, cx| pickers.dismiss_model_menu(cx));
+                    }
                     this.jump_to_session(jump.0, cx)
                 }
             }))
@@ -10784,6 +10778,7 @@ mod shortcut_focus_regressions {
         editor: FocusHandle,
         show_editor: bool,
         jumps: usize,
+        loadouts: usize,
     }
 
     impl Render for ShortcutHost {
@@ -10813,6 +10808,7 @@ mod shortcut_focus_regressions {
                     }),
                 )
                 .on_action(cx.listener(|this, _: &JumpSession, _, _| this.jumps += 1))
+                .on_action(cx.listener(|this, _: &ActivateLoadout, _, _| this.loadouts += 1))
                 .when(self.show_editor, |el| {
                     el.child(div().track_focus(&self.editor))
                 })
@@ -10827,6 +10823,7 @@ mod shortcut_focus_regressions {
             editor: cx.focus_handle(),
             show_editor: true,
             jumps: 0,
+            loadouts: 0,
         });
         cx.run_until_parked();
         cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
@@ -10858,6 +10855,7 @@ mod shortcut_focus_regressions {
             editor: cx.focus_handle(),
             show_editor: true,
             jumps: 0,
+            loadouts: 0,
         });
         for show_editor in [true, false, true, false] {
             host.update(cx, |host, window, cx| {
@@ -10902,6 +10900,7 @@ mod shortcut_focus_regressions {
             editor: cx.focus_handle(),
             show_editor: true,
             jumps: 0,
+            loadouts: 0,
         });
         for (index, x) in [50.0, 150.0, 250.0, 50.0, 150.0, 250.0]
             .into_iter()
@@ -10934,5 +10933,34 @@ mod shortcut_focus_regressions {
             })
             .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn loadout_and_chat_number_shortcuts_dispatch_distinct_actions(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([
+                KeyBinding::new(&platform_combo("mod-1"), JumpSession(0), None),
+                KeyBinding::new(&platform_combo("mod-shift-1"), ActivateLoadout(0), None),
+            ]);
+        });
+        let host = cx.add_window(|_, cx| ShortcutHost {
+            root: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
+            editor: cx.focus_handle(),
+            show_editor: true,
+            jumps: 0,
+            loadouts: 0,
+        });
+        host.update(cx, |host, window, cx| window.focus(&host.editor, cx))
+            .unwrap();
+
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-1"));
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-1"));
+
+        host.update(cx, |host, _, _| {
+            assert_eq!(host.jumps, 1);
+            assert_eq!(host.loadouts, 1);
+        })
+        .unwrap();
     }
 }

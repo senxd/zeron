@@ -8,6 +8,7 @@ use gpui::{
     prelude::*, px,
 };
 
+use crate::settings::loadout_model::is_fixed_loadout_combo;
 use crate::settings::{
     ComposerSendBehavior, KeymapConfig, ShortcutId, combo_from_keystroke, display_combo,
 };
@@ -129,6 +130,14 @@ impl ShortcutsPage {
                     self.conflict_notice = Some(
                         format!("{} is reserved for the composer.", display_combo(&combo)).into(),
                     );
+                    self.recording = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                if is_fixed_loadout_combo(&combo) {
+                    self.conflict_notice =
+                        Some(format!("{} is reserved for loadouts.", display_combo(&combo)).into());
                     self.recording = None;
                     cx.notify();
                     cx.stop_propagation();
@@ -704,5 +713,12 @@ mod tests {
             ComposerSendBehavior::ModEnter,
             "mod-shift-enter"
         ));
+    }
+
+    #[test]
+    fn loadout_shortcuts_are_reserved() {
+        assert!(is_fixed_loadout_combo("mod-shift-1"));
+        assert!(is_fixed_loadout_combo("mod-shift-5"));
+        assert!(!is_fixed_loadout_combo("mod-1"));
     }
 }

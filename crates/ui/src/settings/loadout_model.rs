@@ -49,9 +49,7 @@ impl Default for LoadoutConfig {
 impl LoadoutConfig {
     /// Heal a hand-edited or truncated file into a usable five-slot loadout.
     pub fn clamped(mut self) -> Self {
-        if !prefix_is_valid(&self.prefix) {
-            self.prefix = DEFAULT_LOADOUT_PREFIX.into();
-        }
+        self.prefix = DEFAULT_LOADOUT_PREFIX.into();
         if self.slots.len() > LOADOUT_SLOTS {
             self.slots.truncate(LOADOUT_SLOTS);
         }
@@ -121,6 +119,10 @@ pub fn prefix_is_valid(prefix: &str) -> bool {
 /// `{prefix}-{n}` for a 0-based slot.
 pub fn loadout_combo(prefix: &str, slot: usize) -> String {
     format!("{}-{}", prefix, slot + 1)
+}
+
+pub fn is_fixed_loadout_combo(combo: &str) -> bool {
+    (0..LOADOUT_SLOTS).any(|slot| combo == loadout_combo(DEFAULT_LOADOUT_PREFIX, slot))
 }
 
 /// Drop the trailing key from a full combo, leaving the modifier prefix.
@@ -261,6 +263,7 @@ fn is_speed_option(option: &ModelOption) -> bool {
     let label = option.label.to_ascii_lowercase();
     id.contains("servicetier")
         || id.contains("speed")
+        || id.contains("fast")
         || label == "fast"
         || label == "priority"
         || option.choices.iter().any(is_speed_choice)
@@ -277,6 +280,14 @@ pub fn speed_choice_id(option: &ModelOption) -> Option<&str> {
         .choices
         .iter()
         .find(|choice| is_speed_choice(choice))
+        .or_else(|| {
+            option.choices.iter().find(|choice| {
+                matches!(
+                    choice.id.to_ascii_lowercase().as_str(),
+                    "on" | "true" | "enabled"
+                )
+            })
+        })
         .map(|choice| choice.id.as_str())
 }
 
@@ -386,6 +397,16 @@ mod tests {
         assert_eq!(LoadoutConfig::default().prefix, "mod-shift");
         assert_eq!(loadout_combo("mod-shift", 0), "mod-shift-1");
         assert_eq!(loadout_combo("mod-shift", 4), "mod-shift-5");
+    }
+
+    #[test]
+    fn persisted_prefix_cannot_override_fixed_loadout_shortcuts() {
+        let config = LoadoutConfig {
+            prefix: "mod-alt".into(),
+            ..Default::default()
+        }
+        .clamped();
+        assert_eq!(config.prefix, DEFAULT_LOADOUT_PREFIX);
     }
 
     #[test]
@@ -547,6 +568,28 @@ mod tests {
         assert!(slot_speed_enabled(&slot, Some(&model)));
         set_slot_speed(&mut slot, Some(&model), false);
         assert!(!slot_speed_enabled(&slot, Some(&model)));
+    }
+
+    #[test]
+    fn speed_option_detects_claude_fast_mode_toggle() {
+        let mut model = speed_model();
+        model.options = vec![ModelOption {
+            id: "fastMode".into(),
+            label: "Fast Mode".into(),
+            default_choice: "off".into(),
+            choices: vec![
+                ModelOptionChoice {
+                    id: "off".into(),
+                    label: "Off".into(),
+                },
+                ModelOptionChoice {
+                    id: "on".into(),
+                    label: "On".into(),
+                },
+            ],
+        }];
+        let option = speed_option(&model).expect("fast mode");
+        assert_eq!(speed_choice_id(option), Some("on"));
     }
 
     #[test]

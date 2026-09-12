@@ -21,8 +21,8 @@ pub mod composer;
 pub mod devices;
 pub mod files;
 pub mod harnesses;
-pub mod loadout_model;
 pub mod loadout;
+pub mod loadout_model;
 pub mod notifications;
 pub mod shortcuts;
 pub mod widgets;
@@ -725,14 +725,18 @@ impl KeymapConfig {
         }
     }
 
-    /// Cmd/Ctrl+Enter belongs to the composer on every send mode. Older
-    /// settings could assign it to an app shortcut while plain Enter was the
-    /// configured sender; restore only those newly-conflicting rows to their
-    /// defaults and preserve every unrelated customization.
-    fn heal_reserved_composer_shortcuts(&mut self) {
+    /// Restore persisted shortcuts that collide with fixed app bindings.
+    fn heal_reserved_shortcuts(&mut self) {
         for id in ShortcutId::ALL {
-            if self.get(id) == "mod-enter" {
-                self.reset(id);
+            if self.get(id) == "mod-enter" || loadout_model::is_fixed_loadout_combo(self.get(id)) {
+                let default = id.default_combo();
+                let default_is_taken = ShortcutId::ALL
+                    .into_iter()
+                    .any(|other| other != id && self.get(other) == default);
+                self.set(
+                    id,
+                    (!default_is_taken).then_some(default).unwrap_or("").into(),
+                );
             }
         }
     }
@@ -946,7 +950,7 @@ impl UiSettings {
         self.git_history_column_order = self.git_history_column_order.normalized();
         self.ui_font_size = self.ui_font_size.normalized();
         self.keymap.heal_jump_slots();
-        self.keymap.heal_reserved_composer_shortcuts();
+        self.keymap.heal_reserved_shortcuts();
         self.loadout = self.loadout.clamped();
         self
     }
@@ -1812,6 +1816,36 @@ mod tests {
             ShortcutId::NewSession.default_combo()
         );
         assert_eq!(loaded.keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
+    }
+
+    #[test]
+    fn fixed_loadout_shortcuts_heal_persisted_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"keymap": {"toggleTerminal": "mod-shift-1", "toggleSidebar": "mod-shift-x"}}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            loaded.keymap.get(ShortcutId::ToggleTerminal),
+            ShortcutId::ToggleTerminal.default_combo()
+        );
+        assert_eq!(loaded.keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
+        assert!(conflicted_shortcuts(&loaded.keymap).is_empty());
+    }
+
+    #[test]
+    fn fixed_loadout_healing_does_not_recreate_a_default_conflict() {
+        let mut settings = UiSettings::default();
+        settings.keymap.toggle_sidebar = "mod-1".into();
+        settings.keymap.jump_session[0] = "mod-shift-1".into();
+
+        let loaded = settings.clamped();
+        assert_eq!(loaded.keymap.toggle_sidebar, "mod-1");
+        assert!(loaded.keymap.jump_session[0].is_empty());
+        assert!(conflicted_shortcuts(&loaded.keymap).is_empty());
     }
 
     #[test]

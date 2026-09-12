@@ -1,17 +1,18 @@
 //! Settings → Default models: a five-slot loadout fed by drag-and-drop from
-//! the provider lists, with a click-to-record Cmd+Shift prefix for 1–N.
+//! the provider lists, with fixed Cmd+Shift+1…5 activation shortcuts.
 
 use std::collections::HashMap;
 
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement, KeyDownEvent, Render,
-    SharedString, Window, div, prelude::*, px,
+    SharedString, Subscription, Window, div, prelude::*, px,
 };
 
 use zeron_engine::registry::{HarnessDescriptor, descriptor_enabled};
 use zeron_proto::{HarnessId, Model, ReasoningLevel};
 use zeron_rpc::methods;
 
+use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::pickers::{
     default_model, default_reasoning, harness_brand_icon, normalize_model_rows, reasoning_label,
@@ -98,8 +99,10 @@ pub struct LoadoutPage {
     drag_over: Option<usize>,
     hover_slot: Option<usize>,
     error: Option<SharedString>,
+    search: Entity<ComposerInput>,
     focus: FocusHandle,
     load_task: Option<gpui::Task<()>>,
+    _search_events: Subscription,
 }
 
 impl EventEmitter<LoadoutEvent> for LoadoutPage {}
@@ -116,6 +119,15 @@ impl LoadoutPage {
         keymap: KeymapConfig,
         cx: &mut Context<Self>,
     ) -> Self {
+        let search = cx.new(|cx| {
+            ComposerInput::new("Search models…", cx)
+                .with_accessibility_role(gpui::Role::SearchInput)
+        });
+        let search_events = cx.subscribe(&search, |_this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
+                cx.notify();
+            }
+        });
         let mut page = Self {
             state,
             loadout: loadout.clamped(),
@@ -129,8 +141,10 @@ impl LoadoutPage {
             drag_over: None,
             hover_slot: None,
             error: None,
+            search,
             focus: cx.focus_handle(),
             load_task: None,
+            _search_events: search_events,
         };
         page.load(cx);
         page
@@ -258,19 +272,21 @@ impl LoadoutPage {
                 self.set_recording(false, window, cx);
             }
             RecordPrefixOutcome::Ignored => {}
-            RecordPrefixOutcome::Set(prefix) => {
-                if let Some(owner) = loadout_prefix_conflict(&self.keymap, &prefix) {
+            RecordPrefixOutcome::Set(_) => {
+                if let Some(owner) =
+                    loadout_prefix_conflict(&self.keymap, crate::settings::DEFAULT_LOADOUT_PREFIX)
+                {
                     self.conflict_notice = Some(
                         format!(
                             "{} is already assigned to {}.",
-                            display_loadout_range(&prefix),
+                            display_loadout_range(crate::settings::DEFAULT_LOADOUT_PREFIX),
                             owner.label()
                         )
                         .into(),
                     );
                     self.set_recording(false, window, cx);
                 } else {
-                    self.loadout.prefix = prefix;
+                    self.loadout.prefix = crate::settings::DEFAULT_LOADOUT_PREFIX.into();
                     self.conflict_notice = None;
                     self.set_recording(false, window, cx);
                     self.commit(cx);
@@ -359,6 +375,47 @@ fn catalog_columns(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
             loadout_supports_harness(descriptor.id) && descriptor_enabled(descriptor)
         })
         .collect()
+}
+
+const MODEL_COLUMN_LIMIT: usize = 80;
+
+fn is_openrouter_model(model: &Model) -> bool {
+    model
+        .id
+        .split('/')
+        .next()
+        .is_some_and(|provider| provider.eq_ignore_ascii_case("openrouter"))
+        || model
+            .description
+            .as_deref()
+            .is_some_and(|provider| provider.eq_ignore_ascii_case("openrouter"))
+}
+
+fn filtered_catalog_models<'a>(
+    models: &'a [Model],
+    query: &str,
+    openrouter: Option<bool>,
+) -> Vec<&'a Model> {
+    let query = query.trim();
+    let mut rows: Vec<(usize, usize, &Model)> = models
+        .iter()
+        .enumerate()
+        .filter(|(_, model)| openrouter.is_none_or(|wanted| is_openrouter_model(model) == wanted))
+        .filter_map(|(index, model)| {
+            if query.is_empty() {
+                return Some((0, index, model));
+            }
+            let haystack = format!(
+                "{} {} {}",
+                model.label,
+                model.id,
+                model.description.as_deref().unwrap_or("")
+            );
+            popover::match_rank(query, &haystack).map(|rank| (rank, index, model))
+        })
+        .collect();
+    rows.sort_by_key(|(rank, index, _)| (*rank, *index));
+    rows.into_iter().map(|(_, _, model)| model).collect()
 }
 
 fn nav_row(
@@ -469,9 +526,11 @@ impl LoadoutPage {
                     }
                 },
             ))
-            .on_drop::<LoadoutModelDrag>(cx.listener(move |this, drag: &LoadoutModelDrag, _, cx| {
-                this.drop_model(index, drag, cx);
-            }));
+            .on_drop::<LoadoutModelDrag>(cx.listener(
+                move |this, drag: &LoadoutModelDrag, _, cx| {
+                    this.drop_model(index, drag, cx);
+                },
+            ));
 
         if let Some(slot) = filled {
             let (icon_path, tint) = harness_brand_icon(slot.harness);
@@ -613,16 +672,18 @@ impl LoadoutPage {
             return div().into_any_element();
         };
         let model = self.model_for(slot.harness, &slot.model).cloned();
-        let mut card = popover::popover_card(theme).w(px(260.0)).on_mouse_down_out(
-            cx.listener(|this, _, _, cx| {
+        let mut card = popover::popover_card(theme)
+            .w(px(260.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.slot_menu = SlotMenu::Closed;
                 cx.notify();
-            }),
-        );
+            }));
 
         match self.slot_menu {
             SlotMenu::Root(_) => {
-                let effort_enabled = model.as_ref().is_some_and(|m| !m.reasoning_levels.is_empty());
+                let effort_enabled = model
+                    .as_ref()
+                    .is_some_and(|m| !m.reasoning_levels.is_empty());
                 card = card
                     .child(
                         nav_row(
@@ -638,14 +699,20 @@ impl LoadoutPage {
                         })),
                     )
                     .child(
-                        nav_row(theme, "loadout-nav-model", "Model", slot.label.clone(), true)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(harness) = this.loadout.slot(index).map(|s| s.harness) {
-                                    this.ensure_models(harness, cx);
-                                }
-                                this.slot_menu = SlotMenu::Model(index);
-                                cx.notify();
-                            })),
+                        nav_row(
+                            theme,
+                            "loadout-nav-model",
+                            "Model",
+                            slot.label.clone(),
+                            true,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(harness) = this.loadout.slot(index).map(|s| s.harness) {
+                                this.ensure_models(harness, cx);
+                            }
+                            this.slot_menu = SlotMenu::Model(index);
+                            cx.notify();
+                        })),
                     )
                     .child(
                         nav_row(
@@ -833,11 +900,16 @@ impl LoadoutPage {
     fn render_provider_column(
         &mut self,
         descriptor: &HarnessDescriptor,
+        openrouter_only: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let (icon_path, tint) = harness_brand_icon(descriptor.id);
-        let name = harness_display_name(descriptor.id);
+        let name = if openrouter_only {
+            "OpenRouter"
+        } else {
+            harness_display_name(descriptor.id)
+        };
         let mut column = div()
             .id(SharedString::from(format!("loadout-provider-{name}")))
             .flex()
@@ -898,8 +970,15 @@ impl LoadoutPage {
         match self.models.get(&descriptor.id).cloned() {
             Some(Loadable::Ready(models)) => {
                 let harness = descriptor.id;
-                let rows: Vec<_> = models
-                    .iter()
+                let query = self.search.read(cx).text();
+                let provider_filter =
+                    (descriptor.id == HarnessId::Opencode).then_some(openrouter_only);
+                let filtered = filtered_catalog_models(&models, query, provider_filter);
+                let total = filtered.len();
+                let visible = total.min(MODEL_COLUMN_LIMIT);
+                let rows: Vec<_> = filtered
+                    .into_iter()
+                    .take(visible)
                     .enumerate()
                     .map(|(ix, model)| {
                         let drag = LoadoutModelDrag {
@@ -956,6 +1035,17 @@ impl LoadoutPage {
                     })
                     .collect();
                 column = column.children(rows);
+                if visible < total {
+                    column = column.child(
+                        div()
+                            .pt(px(4.0))
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(format!(
+                                "Showing {visible} of {total}. Search to narrow."
+                            ))),
+                    );
+                }
             }
             Some(Loadable::Error(err)) => {
                 column = column.child(
@@ -980,12 +1070,7 @@ impl LoadoutPage {
     }
 
     fn render_gear_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let chip_text: SharedString = if self.recording {
-            "Press keys…".into()
-        } else {
-            display_loadout_range(&self.loadout.prefix).into()
-        };
-        let mut card = popover::popover_card(theme)
+        popover::popover_card(theme)
             .w(px(280.0))
             .p(px(10.0))
             .on_mouse_down_out(cx.listener(|this, _, window, cx| {
@@ -1014,23 +1099,12 @@ impl LoadoutPage {
                     .justify_center()
                     .font_family(theme.font_mono.clone())
                     .text_size(crate::typography::ui_rems(12.0))
-                    .cursor_pointer()
-                    .map(|el| {
-                        if self.recording {
-                            el.border_color(theme.text.opacity(0.3))
-                                .bg(theme.text)
-                                .text_color(theme.on_solid)
-                        } else {
-                            el.border_color(theme.border)
-                                .bg(theme.bg)
-                                .text_color(theme.text)
-                                .hover(|s| s.border_color(theme.text.opacity(0.2)).bg(ink(0.03)))
-                        }
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.set_recording(!this.recording, window, cx);
-                    }))
-                    .child(chip_text),
+                    .border_color(theme.border)
+                    .bg(theme.bg)
+                    .text_color(theme.text)
+                    .child(SharedString::from(display_loadout_range(
+                        crate::settings::DEFAULT_LOADOUT_PREFIX,
+                    ))),
             )
             .child(
                 div()
@@ -1038,21 +1112,9 @@ impl LoadoutPage {
                     .pt(px(8.0))
                     .text_size(crate::typography::ui_rems(11.0))
                     .text_color(theme.text_muted.opacity(0.7))
-                    .child(SharedString::from(
-                        "Click, then press a combo. Slots stay 1–5.",
-                    )),
-            );
-        if let Some(notice) = &self.conflict_notice {
-            card = card.child(
-                div()
-                    .mt(px(8.0))
-                    .px(px(6.0))
-                    .text_size(crate::typography::ui_rems(11.5))
-                    .text_color(theme.danger_muted)
-                    .child(notice.clone()),
-            );
-        }
-        card.into_any_element()
+                    .child(SharedString::from("Fixed shortcut for loadout slots 1–5.")),
+            )
+            .into_any_element()
     }
 }
 
@@ -1070,10 +1132,13 @@ impl Render for LoadoutPage {
                 .child(SharedString::from("Loading models…"))
                 .into_any_element(),
             Loadable::Ready(list) => {
-                let columns: Vec<_> = catalog_columns(list)
-                    .into_iter()
-                    .map(|descriptor| self.render_provider_column(&descriptor, &theme, cx))
-                    .collect();
+                let mut columns = Vec::new();
+                for descriptor in catalog_columns(list) {
+                    columns.push(self.render_provider_column(&descriptor, false, &theme, cx));
+                    if descriptor.id == HarnessId::Opencode {
+                        columns.push(self.render_provider_column(&descriptor, true, &theme, cx));
+                    }
+                }
                 div()
                     .mt(px(28.0))
                     .flex()
@@ -1112,7 +1177,11 @@ impl Render for LoadoutPage {
             );
         if self.gear_open {
             let menu = self.render_gear_menu(&theme, cx);
-            gear = gear.child(popover::anchored_menu_below("loadout-gear-menu", menu, None));
+            gear = gear.child(popover::anchored_menu_below(
+                "loadout-gear-menu",
+                menu,
+                None,
+            ));
         }
 
         let slots: Vec<_> = (0..LOADOUT_SLOTS)
@@ -1166,7 +1235,60 @@ impl Render for LoadoutPage {
                             .gap(px(10.0))
                             .children(slots),
                     )
+                    .child(
+                        div()
+                            .mt(px(24.0))
+                            .h(px(36.0))
+                            .max_w(px(420.0))
+                            .px(px(10.0))
+                            .rounded(px(8.0))
+                            .border_1()
+                            .border_color(theme.border)
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                icon(icons::MAGNIFER)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(div().flex_1().min_w_0().child(self.search.clone())),
+                    )
                     .child(body),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openrouter_catalog_is_provider_scoped_and_searchable() {
+        let mut models: Vec<Model> = (0..7_000)
+            .map(|index| Model {
+                id: format!("openrouter/model-{index}"),
+                label: format!("Model {index}"),
+                description: Some("OpenRouter".into()),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            })
+            .collect();
+        models.push(Model {
+            id: "anthropic/opus".into(),
+            label: "Opus".into(),
+            description: Some("Anthropic".into()),
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+        });
+
+        let rows = filtered_catalog_models(&models, "model-6999", Some(true));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "openrouter/model-6999");
+        assert!(filtered_catalog_models(&models, "opus", Some(true)).is_empty());
+        assert_eq!(
+            filtered_catalog_models(&models, "opus", Some(false)).len(),
+            1
+        );
     }
 }
