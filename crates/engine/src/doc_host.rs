@@ -4139,12 +4139,14 @@ impl DocHost {
                 // issued_at, clamped against clock skew) — not whenever this
                 // host got around to draining a queued command. Idempotent by
                 // id, so the dispatch path's own execution-time write dedupes
-                // to a no-op.
-                if let Err(err) = handle.write_user_message(
-                    message_id,
-                    &request.prompt,
-                    entry.issued_at.min(now_ms()),
-                ) {
+                // to a no-op. Resume-interrupted turns have no user bubble.
+                if !request.resume_interrupted
+                    && let Err(err) = handle.write_user_message(
+                        message_id,
+                        &request.prompt,
+                        entry.issued_at.min(now_ms()),
+                    )
+                {
                     tracing::warn!(chat = %chat_id, error = %err, "canonical user-message write failed");
                 }
                 self.dispatch_with_source_context(
@@ -4469,6 +4471,7 @@ impl DocHost {
             attachments: Vec::new(),
             resume: None,
             worktree: None,
+            resume_interrupted: false,
         })
     }
 

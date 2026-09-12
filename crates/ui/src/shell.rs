@@ -4674,9 +4674,8 @@ impl Shell {
         )
     }
 
-    /// Settings-mode sidebar (zeron settings-sidebar.tsx): window-control
-    /// strip, "Settings" heading, icon section rows styled like session rows,
-    /// and a Back row pinned to the bottom.
+    /// Settings-mode sidebar (zeron settings-sidebar.tsx): a Back to app row,
+    /// the "Settings" heading, and icon section rows styled like session rows.
     fn render_settings_nav(
         &mut self,
         section: SettingsSection,
@@ -4702,6 +4701,30 @@ impl Shell {
             .h_full()
             .flex()
             .flex_col()
+            .child(
+                div().px(px(Theme::SPACE_SM)).pt(px(12.0)).child(
+                    div()
+                        .id("settings-back")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .rounded(px(8.0))
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(6.0))
+                        .text_size(crate::typography::ui_rems(13.0))
+                        .text_color(theme.text_muted)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
+                        .child(
+                            icon(icons::ALT_ARROW_LEFT)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Back to app")),
+                ),
+            )
             .child(
                 div()
                     .flex_1()
@@ -4755,33 +4778,6 @@ impl Shell {
                                 .child(SharedString::from(item.label()))
                         }),
                     )),
-            )
-            // Back pinned to the bottom (zeron settings-sidebar.tsx).
-            .child(
-                div().px(px(Theme::SPACE_SM)).pb(px(12.0)).child(
-                    div()
-                        .id("settings-back")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .rounded(px(8.0))
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(6.0))
-                        .text_size(crate::typography::ui_rems(13.0))
-                        .text_color(theme.text_muted)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
-                        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
-                        .child(
-                            // AltArrowLeft chevron (zeron settings-sidebar.tsx),
-                            // not the straight history arrow.
-                            icon(icons::ALT_ARROW_LEFT)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(SharedString::from("Back")),
-                ),
             )
             .into_any_element()
     }

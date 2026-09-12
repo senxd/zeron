@@ -229,6 +229,7 @@ fn request(prompt: &str) -> RunRequest {
         attachments: Vec::new(),
         resume: None,
         worktree: None,
+        resume_interrupted: false,
     }
 }
 

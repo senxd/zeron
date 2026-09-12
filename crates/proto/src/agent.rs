@@ -123,7 +123,21 @@ pub struct RunRequest {
     /// host ignores it and runs in `cwd` (the repo's main checkout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeSpec>,
+    /// Continue an interrupted turn without writing a user message. The
+    /// `prompt` is delivered only to the harness (typically
+    /// [`RESUME_INTERRUPTED_PROMPT`]). Additive + serde-defaulted: an old
+    /// host ignores the flag and persists the prompt as a user bubble.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resume_interrupted: bool,
 }
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Harness-only prompt used to continue an interrupted turn. Never written
+/// into the transcript — the user clicked Resume, not Send.
+pub const RESUME_INTERRUPTED_PROMPT: &str = "Continue from where you left off.";
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
 /// by the HOST while draining the queued Run — not by the sender over a
@@ -552,6 +566,23 @@ mod tests {
         assert_eq!(json["worktree"]["repoPath"], "/repos/comet");
         let round: RunRequest = serde_json::from_value(json).unwrap();
         assert_eq!(round.worktree, req.worktree);
+    }
+
+    #[test]
+    fn run_request_resume_interrupted_default_and_round_trip() {
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(!req.resume_interrupted);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("resumeInterrupted").is_none());
+        let req = RunRequest {
+            resume_interrupted: true,
+            ..req
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["resumeInterrupted"], true);
+        let round: RunRequest = serde_json::from_value(json).unwrap();
+        assert!(round.resume_interrupted);
     }
 
     #[test]

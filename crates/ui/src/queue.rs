@@ -268,7 +268,10 @@ impl Composer {
             .queue_drag
             .as_ref()
             .map(|d| (d.from, d.over, d.prev_over, d.epoch));
-        let editing = self.editing_queued.clone();
+        let editing = self
+            .editing_queued
+            .clone()
+            .filter(|_| self.is_editing_current_queue());
 
         let list_chat = chat_id.clone();
         let drop_chat = chat_id.clone();
@@ -849,7 +852,7 @@ impl Composer {
     /// Cmd/Ctrl+Enter on an empty composer activates the same action shown on
     /// the first queued row: Send now, interrupting the current response. An edit/review gate or an old chat host makes it a no-op.
     pub(crate) fn queue_pop_head(&mut self, cx: &mut Context<Self>) {
-        if self.editing_queued.is_some() {
+        if self.is_editing_current_queue() {
             return;
         }
         let (id, delivery_blocked, host_supports_actions) = {
@@ -1050,11 +1053,20 @@ impl Composer {
     /// Save the composer into the existing row, including its attachments.
     /// An entirely empty composer removes the row.
     pub(crate) fn commit_queue_edit(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.editing_queued.is_none() {
+        if !self.is_editing_current_queue() {
             return false;
         }
-        let text = self.input.read(cx).text().trim().to_string();
-        if text.is_empty() && self.staged().is_empty() {
+        let edit_chat_id = self.queue_edit_chat_id.as_deref().unwrap();
+        let text = if edit_chat_id == self.current_key {
+            self.input.read(cx).text().trim().to_string()
+        } else {
+            self.drafts.get(edit_chat_id).cloned().unwrap_or_default()
+        };
+        let has_attachments = self
+            .attachments
+            .get(edit_chat_id)
+            .is_some_and(|attachments| !attachments.is_empty());
+        if text.is_empty() && !has_attachments {
             self.finish_queue_edit("discard", None, cx);
         } else {
             self.finish_queue_edit("commit", Some(text), cx);
@@ -1064,7 +1076,7 @@ impl Composer {
 
     /// Escape out of an edit, leaving the row as it was.
     pub(crate) fn cancel_queue_edit(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.editing_queued.is_none() {
+        if !self.is_editing_current_queue() {
             return false;
         }
         self.finish_queue_edit("cancel", None, cx);
@@ -1077,10 +1089,10 @@ impl Composer {
     }
 
     fn clear_queue_edit_local(&mut self, cx: &mut Context<Self>) {
+        let edit_chat_id = self.queue_edit_chat_id.take();
         self.editing_queued = None;
         self.queue_edit_lease_id = None;
         self.queue_edit_base_text_hash = None;
-        self.queue_edit_chat_id = None;
         self.queue_edit_host_device_id = None;
         self.queue_edit_pending_id = None;
         self.queue_edit_finishing = false;
@@ -1091,9 +1103,15 @@ impl Composer {
         self.queue_edit_task = None;
         self.queue_edit_renew_task = None;
         if let Some((text, attachments)) = self.queue_edit_draft.take() {
-            self.input.update(cx, |input, cx| input.set_text(text, cx));
-            self.attachments
-                .insert(self.current_key.clone(), attachments);
+            let key = edit_chat_id.unwrap_or_else(|| self.current_key.clone());
+            self.attachments.insert(key.clone(), attachments);
+            if key == self.current_key {
+                self.input.update(cx, |input, cx| input.set_text(text, cx));
+            } else if text.is_empty() {
+                self.drafts.remove(&key);
+            } else {
+                self.drafts.insert(key, text);
+            }
         }
         self.focus_pending = true;
         cx.notify();
@@ -1120,7 +1138,7 @@ impl Composer {
             return;
         };
         let expected = self.queue_edit_base_text_hash.clone();
-        let staged = self.staged().to_vec();
+        let staged = self.attachments.get(&chat_id).cloned().unwrap_or_default();
         let mut params = serde_json::json!({
             "chatId": chat_id,
             "id": id,

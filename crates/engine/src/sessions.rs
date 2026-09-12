@@ -350,6 +350,10 @@ impl SessionsEngine {
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
+        let resume_interrupted = request.resume_interrupted;
+        if resume_interrupted && request.prompt.trim().is_empty() {
+            request.prompt = zeron_proto::RESUME_INTERRUPTED_PROMPT.to_string();
+        }
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
@@ -363,7 +367,8 @@ impl SessionsEngine {
         });
         if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
             let user_id = message_id.clone().unwrap_or_else(new_id);
-            let accepted = if steerable && same_runtime {
+            // Resume is a new harness turn, never a steer into a live run.
+            let accepted = if !resume_interrupted && steerable && same_runtime {
                 // Warm dispatch uses the same mailbox as explicit steering.
                 // Register acceptance before a fast boundary can retire it.
                 let mut pending = lock(&ledger);
@@ -428,7 +433,9 @@ impl SessionsEngine {
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
-        handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        if !resume_interrupted {
+            handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        }
 
         // Engine-owned resume (zeron sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -442,7 +449,19 @@ impl SessionsEngine {
             request.resume = self.inner.resume_for(chat_id, &request.cwd);
             resume_injected = request.resume.is_some();
         }
-        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
+        if !resume_interrupted {
+            lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
+        } else {
+            // Keep the original user-turn config. Overwriting it with the
+            // continue prompt would make later steer/crash fallbacks replay
+            // "Continue from where you left off." instead of the task.
+            let mut last_requests = lock(&self.inner.last_requests);
+            if !last_requests.contains_key(chat_id) {
+                let mut stored = request.clone();
+                stored.resume_interrupted = false;
+                last_requests.insert(chat_id.to_string(), stored);
+            }
+        }
 
         let run_id = new_id();
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
@@ -749,6 +768,7 @@ impl SessionsEngine {
                             attachments: Vec::new(),
                             resume: None,
                             worktree: None,
+                            resume_interrupted: false,
                         })
                     });
                 let Some(mut request) = request else {
@@ -1341,6 +1361,7 @@ async fn drive_run(
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
+    let resume_interrupted = request.resume_interrupted;
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
     }
@@ -2138,8 +2159,10 @@ async fn drive_run(
                 inner.journal.clear_resume_attempts(&chat_id);
             }
             // Exchange completed on an untitled chat → name it (fire-and-forget;
-            // interrupted/errored turns never trigger naming).
+            // interrupted/errored turns never trigger naming). Resume continues
+            // an existing turn, so it must not retitle from the continue prompt.
             if *status == DoneStatus::Completed
+                && !resume_interrupted
                 && let Some(titles) = inner.titles.get()
             {
                 titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd);
@@ -2280,6 +2303,7 @@ mod tests {
             resume: None,
             attachments: Vec::new(),
             worktree: None,
+            resume_interrupted: false,
         }
     }
 

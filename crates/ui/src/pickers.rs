@@ -118,6 +118,54 @@ pub enum CheckoutPlan {
     NewWorktree { base: Option<String> },
 }
 
+/// What picking a ref does on an existing session. Worktree rows retarget
+/// `cwd`; plain refs `git checkout` in the space folder (and retarget onto
+/// it when the session is currently on a worktree).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRefAction {
+    /// Already on this checkout.
+    Noop,
+    /// Retarget onto an existing linked worktree (no git).
+    UseWorktree { path: String, branch: String },
+    /// Retarget onto the space folder, already on `branch` there.
+    UseSpace { path: String, branch: String },
+    /// `git checkout` `branch` in the space folder; retarget `cwd` there.
+    Checkout { cwd: String, branch: String },
+}
+
+/// Resolve a mid-session ref pick against the session's current cwd/branch
+/// and the space folder. Pure — the picker applies the result over RPC.
+pub fn session_ref_action(
+    row: &RepoRef,
+    session_cwd: Option<&str>,
+    session_branch: Option<&str>,
+    space_path: &str,
+) -> SessionRefAction {
+    let on_space = session_cwd.map(|cwd| cwd == space_path).unwrap_or(true);
+    if let Some(path) = row.worktree_path.as_deref() {
+        if session_cwd == Some(path) {
+            return SessionRefAction::Noop;
+        }
+        return SessionRefAction::UseWorktree {
+            path: path.to_string(),
+            branch: row.name.clone(),
+        };
+    }
+    if on_space && (session_branch == Some(row.name.as_str()) || row.current) {
+        return SessionRefAction::Noop;
+    }
+    if row.current {
+        return SessionRefAction::UseSpace {
+            path: space_path.to_string(),
+            branch: row.name.clone(),
+        };
+    }
+    SessionRefAction::Checkout {
+        cwd: space_path.to_string(),
+        branch: row.name.clone(),
+    }
+}
+
 /// The fully-resolved run configuration the composer sends: concrete harness,
 /// model and reasoning (never a "default" passthrough once the catalog is
 /// loaded), plus the explicit non-default option picks.
@@ -1233,10 +1281,8 @@ impl Pickers {
     // ---- selections ----
 
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        // Refs are fixed at creation: an existing session can never move
-        // (wing's rule — the footer renders read-only labels there, so this
-        // is a belt-and-braces guard).
         if self.state.read(cx).selected_chat_row().is_some() {
+            self.switch_session_ref(row, cx);
             return;
         }
         if row.worktree_path.is_some() {
@@ -1300,6 +1346,126 @@ impl Pickers {
                 match result {
                     Ok(_) => {
                         pickers.config.branch = Some(ref_name);
+                        pickers.animate_close(cx);
+                        pickers.ensure_refs(true, cx);
+                    }
+                    Err(err) => pickers.switch_error = Some(err.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Mid-session ref pick: retarget onto a worktree or `git checkout` in
+    /// the space folder. Optimistic row stamp + durable mutate; SwitchRef
+    /// failures keep the popover open with git's message.
+    fn switch_session_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
+        if self.switching.is_some() {
+            return;
+        }
+        let Some(chat) = self.state.read(cx).selected_chat_row().cloned() else {
+            return;
+        };
+        let Some(space) = self.state.read(cx).selected_space_row().cloned() else {
+            return;
+        };
+        let action = session_ref_action(
+            &row,
+            chat.cwd.as_deref(),
+            chat.branch.as_deref(),
+            &space.path,
+        );
+        match action {
+            SessionRefAction::Noop => {
+                self.animate_close(cx);
+                cx.notify();
+            }
+            SessionRefAction::UseWorktree { path, branch }
+            | SessionRefAction::UseSpace { path, branch } => {
+                self.stamp_session_checkout(&chat.id, Some(path), Some(branch), cx);
+                self.animate_close(cx);
+                cx.notify();
+            }
+            SessionRefAction::Checkout { cwd, branch } => {
+                self.checkout_session_ref(chat.id, space.device_id, cwd, branch, cx);
+            }
+        }
+    }
+
+    fn stamp_session_checkout(
+        &mut self,
+        chat_id: &str,
+        cwd: Option<String>,
+        branch: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.update(cx, |state, cx| {
+            state.apply_chat_checkout(chat_id, cwd.clone(), branch.clone());
+            cx.notify();
+        });
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let chat_id = chat_id.to_string();
+        self.mutate_task = Some(cx.spawn(async move |_, _| {
+            if let Some(cwd) = cwd {
+                let params = serde_json::json!({
+                    "op": "setChatCwd",
+                    "chatId": chat_id,
+                    "cwd": cwd,
+                });
+                if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                    tracing::warn!(error = %err, "setChatCwd mutate failed");
+                }
+            }
+            if let Some(branch) = branch {
+                let params = serde_json::json!({
+                    "op": "setChatBranch",
+                    "chatId": chat_id,
+                    "branch": branch,
+                });
+                if let Err(err) = engine.client().call(methods::MUTATE, params).await {
+                    tracing::warn!(error = %err, "setChatBranch mutate failed");
+                }
+            }
+        }));
+    }
+
+    fn checkout_session_ref(
+        &mut self,
+        chat_id: String,
+        device_id: String,
+        cwd: String,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let local = self.state.read(cx).local_device_id.clone();
+        self.switch_error = None;
+        self.switching = Some(branch.clone());
+        self.switch_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            params.insert("repoPath".into(), serde_json::Value::String(cwd.clone()));
+            params.insert("refName".into(), serde_json::Value::String(branch.clone()));
+            if local.as_deref() != Some(device_id.as_str()) {
+                params.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(device_id),
+                );
+            }
+            let result = engine
+                .client()
+                .call(methods::SWITCH_REF, serde_json::Value::Object(params))
+                .await;
+            this.update(cx, |pickers, cx| {
+                pickers.switching = None;
+                match result {
+                    Ok(_) => {
+                        pickers.stamp_session_checkout(&chat_id, Some(cwd), Some(branch), cx);
                         pickers.animate_close(cx);
                         pickers.ensure_refs(true, cx);
                     }
@@ -2482,20 +2648,40 @@ impl Pickers {
         };
 
         if let Some(chat) = &session {
-            // Sessions never move: read-only checkout-kind + ref labels,
-            // LEFT-aligned, only when the session's project has git. The
-            // target (project @ device) lives in the titlebar now.
+            // Existing session: checkout-kind stays a read-only label (the
+            // session is already on a checkout); the ref chip opens the
+            // same search/worktree picker as a new chat and switches cwd.
             let Some(space) = space.as_ref().filter(|s| s.git_detected) else {
                 return None;
             };
+            self.ensure_refs(false, cx);
             let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
             let (icon_path, label) = if is_worktree {
                 (crate::icons::FOLDER_WITH_FILES, "Worktree")
             } else {
                 (crate::icons::FOLDER, "Local checkout")
             };
-            // Mirrors the draft chips: checkout hugs the left edge, ref the
-            // right.
+            let closing = self.open.closing_since();
+            let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
+                Some(PickerKind::Branch) => {
+                    let content = self.render_branch_popover(cx);
+                    Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
+                }
+                _ => None,
+            };
+            let ref_label = chat
+                .branch
+                .clone()
+                .map(SharedString::from)
+                .unwrap_or_else(|| SharedString::from("No ref"));
+            let ref_chip = self.footer_chip(
+                PickerKind::Branch,
+                "picker-branch",
+                crate::icons::GIT_BRANCH,
+                ref_label,
+                &theme,
+                cx,
+            );
             let left = div()
                 .flex()
                 .flex_row()
@@ -2520,13 +2706,12 @@ impl Pickers {
                         &theme,
                     ))
                 })
-                .child(Self::footer_label(
-                    crate::icons::GIT_BRANCH,
-                    chat.branch
-                        .clone()
-                        .map(SharedString::from)
-                        .unwrap_or_else(|| SharedString::from("No ref")),
-                    &theme,
+                .child(attach_overlay_end(
+                    ref_chip,
+                    &mut overlay,
+                    PickerKind::Branch,
+                    "branch-popover",
+                    closing,
                 ));
             // The context indicator follows this footer in the composer;
             // its own padding supplies the spacing after the branch label.
@@ -4194,7 +4379,7 @@ impl Render for Pickers {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+    use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice, RepoRef};
 
     #[gpui::test]
     fn picker_completion_and_dismissal_have_distinct_focus_behavior(cx: &mut gpui::TestAppContext) {
@@ -4294,6 +4479,59 @@ mod tests {
             assert_eq!(pickers.selected_space_index(cx), 0); // empty device
             assert!(pickers.target_generation >= 2);
         });
+    }
+
+    fn repo_ref(name: &str, current: bool, worktree: Option<&str>) -> RepoRef {
+        RepoRef {
+            name: name.into(),
+            current,
+            worktree_path: worktree.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn session_ref_action_jumps_to_worktrees_and_checks_out_plain_refs() {
+        let space = "/repo";
+        let main = repo_ref("main", true, None);
+        let qol = repo_ref("qol", false, Some("/wt/qol"));
+        let feature = repo_ref("feature", false, None);
+
+        assert_eq!(
+            session_ref_action(&main, Some(space), Some("main"), space),
+            SessionRefAction::Noop
+        );
+        assert_eq!(
+            session_ref_action(&qol, Some("/wt/qol"), Some("qol"), space),
+            SessionRefAction::Noop
+        );
+        assert_eq!(
+            session_ref_action(&qol, Some(space), Some("main"), space),
+            SessionRefAction::UseWorktree {
+                path: "/wt/qol".into(),
+                branch: "qol".into(),
+            }
+        );
+        assert_eq!(
+            session_ref_action(&main, Some("/wt/qol"), Some("qol"), space),
+            SessionRefAction::UseSpace {
+                path: space.into(),
+                branch: "main".into(),
+            }
+        );
+        assert_eq!(
+            session_ref_action(&feature, Some(space), Some("main"), space),
+            SessionRefAction::Checkout {
+                cwd: space.into(),
+                branch: "feature".into(),
+            }
+        );
+        assert_eq!(
+            session_ref_action(&feature, Some("/wt/qol"), Some("qol"), space),
+            SessionRefAction::Checkout {
+                cwd: space.into(),
+                branch: "feature".into(),
+            }
+        );
     }
 
     fn bare_model(id: &str, label: &str) -> Model {

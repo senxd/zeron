@@ -2,7 +2,7 @@
 //! journal + broadcast + folded doc entries, plus interrupt/recovery/idempotence
 //! and the RPC surface over the in-memory transport.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -38,6 +38,7 @@ fn run_request(prompt: &str) -> RunRequest {
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+        resume_interrupted: false,
     }
 }
 
@@ -521,6 +522,156 @@ async fn interrupt_stamps_streaming_entry_aborted() {
     );
 }
 
+/// Resume after Stop: the continue prompt reaches the harness (with the
+/// stored session id injected) but does not grow a user bubble.
+#[tokio::test]
+async fn resume_interrupted_does_not_write_a_user_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(dir.path(), Arc::new(ResumeHarness { seen: seen.clone() }));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-hang",
+        SessionCommandPayload::Run {
+            request: run_request("hang"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            entries(&core)
+                .iter()
+                .any(|e| e.status == Some(MessageStatus::Streaming))
+        },
+        "streaming entry",
+    )
+    .await;
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-int-1",
+        SessionCommandPayload::Interrupt {},
+    );
+    wait_for(
+        || {
+            entries(&core)
+                .iter()
+                .any(|e| e.status == Some(MessageStatus::Aborted))
+        },
+        "aborted stamp",
+    )
+    .await;
+
+    let mut resume = run_request(zeron_proto::RESUME_INTERRUPTED_PROMPT);
+    resume.resume_interrupted = true;
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-resume",
+        SessionCommandPayload::Run {
+            request: resume,
+            message_id: "m-resume".into(),
+        },
+    );
+    wait_for(
+        || {
+            entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+        },
+        "resumed assistant turn",
+    )
+    .await;
+
+    let all = entries(&core);
+    let users: Vec<_> = all.iter().filter(|e| e.role == MessageRole::User).collect();
+    assert_eq!(
+        users.len(),
+        1,
+        "resume must not append a user bubble: {all:?}"
+    );
+    match &users[0].parts[0] {
+        MessagePart::Text { text, .. } => assert_eq!(text, "hang"),
+        other => panic!("unexpected user part {other:?}"),
+    }
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].resume_interrupted);
+    assert_eq!(requests[1].prompt, zeron_proto::RESUME_INTERRUPTED_PROMPT);
+    assert_eq!(requests[1].resume.as_deref(), Some("hs-1"));
+}
+
+type RequestLog = Arc<Mutex<Vec<RunRequest>>>;
+
+struct ResumeHarness {
+    seen: RequestLog,
+}
+
+#[async_trait]
+impl Harness for ResumeHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Resume"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let n = {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(request.clone());
+            seen.len()
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
+        let token = controls.interrupt.clone();
+        tokio::spawn(async move {
+            let session = AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: vec![],
+                cwd: "/tmp".into(),
+                session_id: "hs-1".into(),
+                assistant_message_id: format!("a-{n}"),
+            };
+            let _ = tx.send(Ok(session)).await;
+            if n == 1 {
+                let _ = tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: "partial".into(),
+                    }))
+                    .await;
+                token.cancelled().await;
+                let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
+            } else {
+                let _ = tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: "continued".into(),
+                    }))
+                    .await;
+                let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+            }
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn interrupt_is_scoped_to_the_target_chat() {
     const CHAT_A: &str = "chat-interrupt-a";
@@ -810,9 +961,9 @@ async fn retry_reissues_a_swallowed_send() {
     .await;
     wait_for(
         || {
-            entries_now(&core)
-                .iter()
-                .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "re-issued send runs to completion",
     )
@@ -1919,6 +2070,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         attachments: vec![path],
         resume: None,
         worktree: None,
+        resume_interrupted: false,
     };
     core.doc_host
         .queue_command(
@@ -2019,11 +2171,9 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     );
     wait_for(
         || {
-            entries(&core)
-                .iter()
-                .any(|e| {
-                    e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
-                })
+            entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "run completes",
     )

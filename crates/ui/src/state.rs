@@ -923,6 +923,24 @@ impl AppState {
         }
     }
 
+    /// Optimistic local echo of a mid-session checkout switch: stamp cwd
+    /// and/or branch now so the composer chip updates on click.
+    pub fn apply_chat_checkout(
+        &mut self,
+        chat_id: &str,
+        cwd: Option<String>,
+        branch: Option<String>,
+    ) {
+        if let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) {
+            if let Some(cwd) = cwd {
+                chat.cwd = Some(cwd);
+            }
+            if let Some(branch) = branch {
+                chat.branch = Some(branch);
+            }
+        }
+    }
+
     pub fn apply_connectivity(&mut self, connectivity: zeron_proto::Connectivity) {
         self.connectivity = connectivity;
     }
@@ -3591,6 +3609,10 @@ mod tests {
                 .is_none()
         );
         // Unknown chat: no-op, no panic.
+        state.apply_chat_checkout("a", Some("/wt/qol".into()), Some("qol".into()));
+        let chat = state.chats.iter().find(|c| c.id == "a").unwrap();
+        assert_eq!(chat.cwd.as_deref(), Some("/wt/qol"));
+        assert_eq!(chat.branch.as_deref(), Some("qol"));
         state.apply_chat_config(
             "missing",
             zeron_proto::ChatConfig {

@@ -92,6 +92,9 @@ icon_assets![
     (ARROW_LEFT, "arrow-left"),
     (ARROW_RIGHT, "arrow-right"),
     (ARROW_UP, "arrow-up"),
+    // Play triangle in the Solar Linear style — resume after an interrupted
+    // turn (the set has no play glyph).
+    (PLAY, "play"),
     // arrow-up mirrored (like the sidebar flip) — the Solar Linear set here
     // has no plain arrow-down.
     (ARROW_DOWN, "arrow-down"),

@@ -64,6 +64,7 @@ async fn check_persistence(
         attachments: vec![],
         worktree: None,
         resume: None,
+        resume_interrupted: false,
     };
     core.sessions
         .dispatch(

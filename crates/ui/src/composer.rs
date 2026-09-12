@@ -24,10 +24,12 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
+use zeron_doc::{
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry,
+};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
-    UserInputQuestion, capabilities,
+    FileSearchMatch, HarnessId, RESUME_INTERRUPTED_PROMPT, RunRequest, SandboxLevel, SlashCommand,
+    UserInputAnswer, UserInputQuestion, capabilities,
 };
 use zeron_rpc::{RpcError, methods};
 
@@ -464,6 +466,8 @@ pub enum SendButtonMode {
     Queue,
     /// Live run, nothing typed: red stop square.
     Stop,
+    /// Idle after an interrupted turn, composer empty: resume the agent loop.
+    Resume,
 }
 
 /// What the composer holds that a send could carry. A staged image or diff
@@ -487,11 +491,33 @@ fn modified_submit_target(has_content: bool) -> ModifiedSubmitTarget {
     }
 }
 
-pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
-    match (run_live, has_text) {
-        (false, _) => SendButtonMode::Send,
-        (true, true) => SendButtonMode::Queue,
-        (true, false) => SendButtonMode::Stop,
+pub fn send_button_mode(
+    run_live: bool,
+    has_text: bool,
+    last_turn_interrupted: bool,
+) -> SendButtonMode {
+    match (run_live, has_text, last_turn_interrupted) {
+        (true, true, _) => SendButtonMode::Queue,
+        (true, false, _) => SendButtonMode::Stop,
+        (false, false, true) => SendButtonMode::Resume,
+        (false, _, _) => SendButtonMode::Send,
+    }
+}
+
+/// An interrupted session is a terminated agent loop that never finished
+/// cleanly: the last transcript entry is an aborted assistant turn. A later
+/// user message (or a completed assistant turn) clears it — Resume must not
+/// show after a full turn, and must not steal a follow-up that is already in
+/// the transcript.
+pub fn last_turn_interrupted(transcript: &[SessionMessageEntry]) -> bool {
+    match transcript.last() {
+        Some(entry)
+            if entry.role == MessageRole::Assistant
+                && entry.status == Some(MessageStatus::Aborted) =>
+        {
+            true
+        }
+        _ => false,
     }
 }
 
@@ -3891,6 +3917,18 @@ fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
     state.request == request && state.token.is_some()
 }
 
+fn queue_edit_row_exists_for_visible_chat(
+    editing_chat_id: Option<&str>,
+    editing_id: Option<&str>,
+    visible_chat_id: &str,
+    queue_has_id: bool,
+) -> bool {
+    if editing_chat_id != Some(visible_chat_id) {
+        return true;
+    }
+    editing_id.is_none_or(|_| queue_has_id)
+}
+
 /// A failed file search, translated for the popup. `UnknownMethod` is the
 /// version-skew case: `SearchFiles` shipped after v0.1.9, so a session hosted
 /// by a device on an older daemon answers "unknown method" while the same
@@ -3928,7 +3966,7 @@ pub struct Composer {
     /// device/project target selectors ([`Pickers::render_target_selectors`]).
     pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
-    drafts: HashMap<String, String>,
+    pub(crate) drafts: HashMap<String, String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     pub(crate) attachments: HashMap<String, Vec<StagedAttachment>>,
@@ -4253,6 +4291,11 @@ impl Composer {
 
     pub(crate) fn can_edit_queue_in_composer(&self) -> bool {
         !self.sending && self.wizard.is_none()
+    }
+
+    pub(crate) fn is_editing_current_queue(&self) -> bool {
+        self.editing_queued.is_some()
+            && self.queue_edit_chat_id.as_deref() == Some(self.current_key.as_str())
     }
 
     // ---- attachment staging (use-attachments.ts) ----
@@ -5298,24 +5341,27 @@ impl Composer {
             .retain(|chat_id, _| self.interrupting.contains(chat_id));
 
         let editing_id = self.editing_queued.clone();
+        let editing_chat_id = self.queue_edit_chat_id.clone();
         let (key, pending, edited_row_exists) = {
             let s = self.state.read(cx);
             (
                 s.selected_chat.clone().unwrap_or_default(),
                 pending_input_request(&s.transcript),
-                editing_id
-                    .as_ref()
-                    .is_none_or(|id| s.queue.iter().any(|item| item.id == *id)),
+                queue_edit_row_exists_for_visible_chat(
+                    editing_chat_id.as_deref(),
+                    editing_id.as_deref(),
+                    s.selected_chat.as_deref().unwrap_or_default(),
+                    editing_id
+                        .as_ref()
+                        .is_some_and(|id| s.queue.iter().any(|item| item.id == *id)),
+                ),
             )
         };
 
-        // A queue edit belongs to exactly one visible row. Navigation or a
-        // remote drain/removal cancels it instead of leaving a focused but
-        // unmounted editor entity behind.
-        if key != self.current_key && self.editing_queued.is_some() {
-            self.clear_queue_edit(cx);
-        } else if !edited_row_exists && self.editing_queued.is_some() && !self.queue_edit_finishing
-        {
+        // A queue edit belongs to exactly one chat. Keep it alive across tab
+        // switches, and only treat a missing row as a removal when that chat
+        // is visible again.
+        if !edited_row_exists && self.editing_queued.is_some() && !self.queue_edit_finishing {
             self.failure =
                 Some("The queued message was removed; your edit remains in the composer".into());
             // Recover both drafts when another device removes the reserved row.
@@ -5372,7 +5418,7 @@ impl Composer {
         }
 
         // A pending agent question must not take over an active queue edit.
-        if self.editing_queued.is_some() {
+        if self.is_editing_current_queue() {
             cx.notify();
             return;
         }
@@ -5455,7 +5501,7 @@ impl Composer {
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
-        if self.editing_queued.is_some() {
+        if self.is_editing_current_queue() {
             return SendButtonMode::Send;
         }
         let has_text = composer_has_content(
@@ -5463,7 +5509,9 @@ impl Composer {
             self.staged().len(),
             self.staged_comments(cx).len(),
         );
-        send_button_mode(self.run_live(cx), has_text)
+        let state = self.state.read(cx);
+        let interrupted = state.selected_chat.is_some() && last_turn_interrupted(&state.transcript);
+        send_button_mode(self.run_live(cx), has_text, interrupted)
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
@@ -5484,6 +5532,7 @@ impl Composer {
             !composer_has_content(&text, self.staged().len(), self.staged_comments(cx).len());
         match self.button_mode(cx) {
             SendButtonMode::Stop => self.interrupt_selected(cx),
+            SendButtonMode::Resume => self.resume_interrupted_turn(cx),
             _ if no_content => {}
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Send => self.send(text, false, cx),
@@ -6052,6 +6101,7 @@ impl Composer {
                         resume: None,
                         attachments: attachment_paths,
                         worktree: run_worktree,
+                        resume_interrupted: false,
                     },
                     message_id: message_id.clone(),
                 };
@@ -6171,6 +6221,80 @@ impl Composer {
             return;
         };
         self.interrupt_chat(chat_id, cx);
+    }
+
+    /// Continue an interrupted turn without sending a new user message. The
+    /// harness sees [`RESUME_INTERRUPTED_PROMPT`] against the stored session;
+    /// the transcript does not grow a user bubble.
+    fn resume_interrupted_turn(&mut self, cx: &mut Context<Self>) {
+        if self.send_blocked(cx) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            self.failure_key = None;
+            cx.notify();
+            return;
+        };
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        let resolved = self.pickers.read(cx).resolved(cx);
+        let cwd = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|c| c.cwd.clone())
+            .unwrap_or_else(|| ".".to_string());
+        let sandbox = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|c| c.config.as_ref().map(|cfg| cfg.sandbox))
+            .unwrap_or(SandboxLevel::WorkspaceWrite);
+        let command = SessionCommandPayload::Run {
+            request: RunRequest {
+                prompt: RESUME_INTERRUPTED_PROMPT.to_string(),
+                harness: resolved.harness,
+                model: resolved.model.clone(),
+                reasoning: resolved.reasoning,
+                model_options: resolved.model_options.clone(),
+                cwd,
+                sandbox,
+                auto_approve: false,
+                resume: None,
+                attachments: Vec::new(),
+                worktree: None,
+                resume_interrupted: true,
+            },
+            message_id: uuid::Uuid::new_v4().to_string(),
+        };
+        let Ok(command) = serde_json::to_value(&command) else {
+            self.failure = Some("Resume failed: could not encode command".into());
+            self.failure_key = Some(chat_id);
+            cx.notify();
+            return;
+        };
+        let params = serde_json::json!({ "chatId": chat_id, "command": command });
+        let failure_chat = chat_id.clone();
+        self.action_task = Some(cx.spawn(async move |this, cx| {
+            let result = attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                methods::QUEUE_COMMAND,
+                params,
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+            if let Err(err) = result {
+                this.update(cx, |composer, cx| {
+                    composer.failure = Some(format!("Resume failed: {err}").into());
+                    composer.failure_key = Some(failure_chat);
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
     }
 
     pub(crate) fn interrupt_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
@@ -6588,12 +6712,17 @@ impl Composer {
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt_selected(cx)))
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
-            SendButtonMode::Send | SendButtonMode::Queue => {
+            SendButtonMode::Send | SendButtonMode::Queue | SendButtonMode::Resume => {
                 // Share the submission guard with Enter, including pending
                 // edits and the new-session runnable-agent check.
                 let blocked = self.send_blocked(cx);
+                let resume = matches!(mode, SendButtonMode::Resume);
                 div()
-                    .id("composer-send")
+                    .id(if resume {
+                        "composer-resume"
+                    } else {
+                        "composer-send"
+                    })
                     .size(px(28.0))
                     .flex_none()
                     .rounded_full()
@@ -6608,9 +6737,13 @@ impl Composer {
                             .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
                     })
                     .child(
-                        crate::icons::icon(crate::icons::ARROW_UP)
-                            .size(px(14.0))
-                            .text_color(theme.bg),
+                        crate::icons::icon(if resume {
+                            crate::icons::PLAY
+                        } else {
+                            crate::icons::ARROW_UP
+                        })
+                        .size(px(14.0))
+                        .text_color(theme.bg),
                     )
                     .into_any_element()
             }
@@ -6902,7 +7035,7 @@ impl Render for Composer {
         // typed in — the queue is a property of this composer, not a panel
         // somewhere else.
         let show_queue_head_shortcut = self.queue_shortcut_revealed
-            && self.editing_queued.is_none()
+            && !self.is_editing_current_queue()
             && !self.pickers.read(cx).is_open()
             && !composer_has_content(
                 self.input.read(cx).text(),
@@ -6926,7 +7059,7 @@ impl Render for Composer {
         // Escape backs out of a queue-row edit (the row keeps its old text).
         // Bound here rather than in the input: the input's own Escape belongs
         // to the mention/slash popups, which outrank this while they're open.
-        let container = container.when(self.editing_queued.is_some(), |el| {
+        let container = container.when(self.is_editing_current_queue(), |el| {
             el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape"
                     && this.mention.token.is_none()
@@ -8556,29 +8689,87 @@ mod tests {
         let live = true;
         let comment_only = composer_has_content("", 0, 2);
         assert_eq!(
-            send_button_mode(live, comment_only),
+            send_button_mode(live, comment_only, false),
             SendButtonMode::Queue,
             "comment-only submit must queue without interrupting the run"
         );
         // Nothing staged at all is still the stop square.
         assert_eq!(
-            send_button_mode(live, composer_has_content("", 0, 0)),
+            send_button_mode(live, composer_has_content("", 0, 0), false),
             SendButtonMode::Stop
         );
     }
 
     #[test]
     fn send_button_morph() {
-        assert_eq!(send_button_mode(false, false), SendButtonMode::Send);
-        assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
-        assert_eq!(send_button_mode(true, true), SendButtonMode::Queue);
-        assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
+        assert_eq!(send_button_mode(false, false, false), SendButtonMode::Send);
+        assert_eq!(send_button_mode(false, true, false), SendButtonMode::Send);
+        assert_eq!(send_button_mode(true, true, false), SendButtonMode::Queue);
+        assert_eq!(send_button_mode(true, false, false), SendButtonMode::Stop);
+        assert_eq!(send_button_mode(false, false, true), SendButtonMode::Resume);
+        assert_eq!(
+            send_button_mode(false, true, true),
+            SendButtonMode::Send,
+            "typed follow-up after interrupt is a new send, not resume"
+        );
+        assert_eq!(
+            send_button_mode(true, false, true),
+            SendButtonMode::Stop,
+            "a live run still stops, even if the prior turn was aborted"
+        );
+    }
+
+    #[test]
+    fn last_turn_interrupted_is_the_trailing_aborted_assistant_entry() {
+        fn entry(role: MessageRole, status: Option<MessageStatus>) -> SessionMessageEntry {
+            SessionMessageEntry {
+                id: "e".into(),
+                role,
+                parts: Vec::new(),
+                created_at: 1,
+                device_id: "d".into(),
+                status,
+                continuation_of: None,
+            }
+        }
+        assert!(!last_turn_interrupted(&[]));
+        assert!(!last_turn_interrupted(&[entry(
+            MessageRole::Assistant,
+            Some(MessageStatus::Complete)
+        )]));
+        assert!(last_turn_interrupted(&[entry(
+            MessageRole::Assistant,
+            Some(MessageStatus::Aborted)
+        )]));
+        assert!(
+            !last_turn_interrupted(&[
+                entry(MessageRole::Assistant, Some(MessageStatus::Aborted)),
+                entry(MessageRole::User, Some(MessageStatus::Complete)),
+            ]),
+            "a follow-up user message means the interrupted turn is no longer last"
+        );
     }
 
     #[test]
     fn queued_submit_does_not_publish_an_optimistic_transcript_echo() {
         assert!(should_publish_optimistic_echo(false));
         assert!(!should_publish_optimistic_echo(true));
+    }
+
+    #[test]
+    fn queue_edit_row_stays_present_while_viewing_another_chat() {
+        assert!(queue_edit_row_exists_for_visible_chat(
+            Some("chat-a"),
+            Some("queued-1"),
+            "chat-b",
+            false,
+        ));
+        assert!(!queue_edit_row_exists_for_visible_chat(
+            Some("chat-a"),
+            Some("queued-1"),
+            "chat-a",
+            false,
+        ));
     }
 
     #[test]
