@@ -200,6 +200,18 @@ pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
     }
 }
 
+fn reasoning_meter_position(active_level: usize, level_count: usize) -> f32 {
+    if level_count == 0 {
+        0.0
+    } else {
+        (active_level as f32 + 0.5) / level_count as f32
+    }
+}
+
+fn picker_frame_height(child_heights: &[f32]) -> f32 {
+    (child_heights.iter().sum::<f32>() + 2.0).min(640.0)
+}
+
 /// The TraitsPicker trigger summary: the effective reasoning level plus each
 /// non-speed option's effective choice. Speed is rendered as an icon beside
 /// this text. `None` means the model has nothing textual to describe.
@@ -454,7 +466,7 @@ impl gpui::EventEmitter<ReturnComposerFocus> for Pickers {}
 impl gpui::EventEmitter<OpenLoadoutSettings> for Pickers {}
 
 #[derive(Clone)]
-struct ReasoningMotion {
+struct ScalarMotion {
     identity: String,
     from: f32,
     to: f32,
@@ -462,7 +474,7 @@ struct ReasoningMotion {
     epoch: u64,
 }
 
-impl ReasoningMotion {
+impl ScalarMotion {
     fn value(&self, now: Instant) -> f32 {
         let duration = motion::MODEL_PICKER_CHANGE
             .total()
@@ -536,7 +548,8 @@ pub struct Pickers {
     /// Last mid-session switch failure (shown in the ref popover).
     switch_error: Option<String>,
     mutate_task: Option<Task<()>>,
-    reasoning_motion: Option<ReasoningMotion>,
+    reasoning_motion: Option<ScalarMotion>,
+    model_picker_height_motion: Option<ScalarMotion>,
     _search_events: Subscription,
     _state_observe: Subscription,
     _catalog_observe: Subscription,
@@ -683,6 +696,7 @@ impl Pickers {
             switch_error: None,
             mutate_task: None,
             reasoning_motion: None,
+            model_picker_height_motion: None,
             _search_events: search_events,
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
@@ -696,6 +710,39 @@ impl Pickers {
         {
             tracing::warn!(error = %err, "composer-defaults save failed");
         }
+    }
+
+    fn set_model_picker_height(&mut self, identity: String, target: f32, cx: &mut Context<Self>) {
+        if self
+            .model_picker_height_motion
+            .as_ref()
+            .is_some_and(|motion| motion.identity == identity && (motion.to - target).abs() < 0.5)
+        {
+            return;
+        }
+        let now = Instant::now();
+        let (from, epoch) = self
+            .model_picker_height_motion
+            .as_ref()
+            .map(|motion| {
+                (
+                    if cx.reduce_motion() {
+                        target
+                    } else {
+                        motion.value(now)
+                    },
+                    motion.epoch.wrapping_add(1),
+                )
+            })
+            .unwrap_or((target, 0));
+        self.model_picker_height_motion = Some(ScalarMotion {
+            identity,
+            from,
+            to: target,
+            started: now,
+            epoch,
+        });
+        cx.notify();
     }
 
     pub fn draft(&self) -> &DraftConfig {
@@ -3478,6 +3525,15 @@ impl Pickers {
                 .child(sections)
                 .into_any_element()
         });
+        let layout_identity = format!(
+            "{:?}:{:?}:{}",
+            self.model_rail,
+            effective,
+            self.selected_model(cx)
+                .map(|model| model.id.as_str())
+                .unwrap_or("")
+        );
+        let this = cx.weak_entity();
 
         div()
             .flex()
@@ -3486,6 +3542,20 @@ impl Pickers {
             .child(search_row)
             .child(tabs)
             .children(tray)
+            .on_children_prepainted(move |bounds, _, cx| {
+                let heights = bounds
+                    .iter()
+                    .map(|bounds| f32::from(bounds.size.height))
+                    .collect::<Vec<_>>();
+                let target = picker_frame_height(&heights);
+                let identity = layout_identity.clone();
+                let this = this.clone();
+                cx.defer(move |cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.set_model_picker_height(identity, target, cx)
+                    });
+                });
+            })
             .into_any_element()
     }
 
@@ -3786,11 +3856,7 @@ impl Pickers {
                     .size(px(17.0))
                     .text_color(theme.text_muted),
             );
-        let target = if levels.is_empty() {
-            0.0
-        } else {
-            (active_level as f32 + 0.5) / levels.len() as f32
-        };
+        let target = reasoning_meter_position(active_level, levels.len());
         let identity = format!(
             "{:?}:{}:{:?}:{}",
             self.effective_harness(cx),
@@ -3818,7 +3884,7 @@ impl Pickers {
                     )
                 })
                 .unwrap_or((target, 0));
-            self.reasoning_motion = Some(ReasoningMotion {
+            self.reasoning_motion = Some(ScalarMotion {
                 identity,
                 from,
                 to: target,
@@ -3838,19 +3904,30 @@ impl Pickers {
                 .top_0()
                 .bottom_0()
                 .left_0()
-                .rounded(px(15.0))
                 .bg(theme.accent.opacity(0.72))
                 .with_animation(
                     SharedString::from(format!("reasoning-fill-{epoch}")),
                     motion::MODEL_PICKER_CHANGE.animation(),
                     move |el, t| el.w(gpui::relative(motion::lerp(from, to, t))),
                 );
+            let fill_cap = div()
+                .absolute()
+                .top_0()
+                .size(px(30.0))
+                .ml(px(-15.0))
+                .rounded(px(15.0))
+                .bg(theme.accent.opacity(0.72))
+                .with_animation(
+                    SharedString::from(format!("reasoning-fill-cap-{epoch}")),
+                    motion::MODEL_PICKER_CHANGE.animation(),
+                    move |el, t| el.left(gpui::relative(motion::lerp(from, to, t))),
+                );
             let thumb = div()
                 .absolute()
-                .top(px(7.0))
-                .size(px(16.0))
-                .ml(px(-8.0))
-                .rounded(px(8.0))
+                .top(px(-1.0))
+                .size(px(32.0))
+                .ml(px(-16.0))
+                .rounded(px(16.0))
                 .bg(theme.text)
                 .with_animation(
                     SharedString::from(format!("reasoning-thumb-{epoch}")),
@@ -3865,6 +3942,7 @@ impl Pickers {
                 .overflow_hidden()
                 .bg(crate::theme::ink(0.08))
                 .child(fill)
+                .child(fill_cap)
                 .child(
                     div()
                         .absolute()
@@ -4415,6 +4493,21 @@ impl Render for Pickers {
             Some(PickerKind::HarnessModel) => {
                 let content = self.render_harness_model_popover(cx);
                 let frame = self.popover_frame_flush(304.0, content, cx);
+                let frame: AnyElement =
+                    if let Some(height) = self.model_picker_height_motion.clone() {
+                        let (from, to, epoch) = (height.from, height.to, height.epoch);
+                        div()
+                            .overflow_hidden()
+                            .child(frame)
+                            .with_animation(
+                                SharedString::from(format!("model-picker-resize-{epoch}")),
+                                motion::MODEL_PICKER_CHANGE.animation(),
+                                move |el, t| el.h(px(motion::lerp(from, to, t))),
+                            )
+                            .into_any_element()
+                    } else {
+                        frame
+                    };
                 Some((
                     PickerKind::HarnessModel,
                     div()
@@ -4941,7 +5034,7 @@ mod tests {
     #[test]
     fn reasoning_motion_interpolates_and_settles() {
         let started = Instant::now();
-        let tween = ReasoningMotion {
+        let tween = ScalarMotion {
             identity: "cursor:composer:high".into(),
             from: 0.25,
             to: 0.75,
@@ -4953,6 +5046,17 @@ mod tests {
             tween.value(started + motion::MODEL_PICKER_CHANGE.total()),
             0.75
         );
+    }
+
+    #[test]
+    fn reasoning_cap_and_thumb_share_the_same_center() {
+        assert_eq!(reasoning_meter_position(5, 7), 5.5 / 7.0);
+    }
+
+    #[test]
+    fn measured_picker_children_produce_the_frame_height() {
+        assert_eq!(picker_frame_height(&[216.0, 40.0, 40.0, 97.0]), 395.0);
+        assert_eq!(picker_frame_height(&[700.0]), 640.0);
     }
 
     #[test]
