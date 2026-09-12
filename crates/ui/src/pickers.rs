@@ -3706,6 +3706,12 @@ impl Pickers {
                         .cursor_pointer()
                         .when(index <= active_level, |el| {
                             el.bg(theme.accent.opacity(0.72))
+                                .when(index == 0, |el| {
+                                    el.rounded_tl(px(15.0)).rounded_bl(px(15.0))
+                                })
+                                .when(index == active_level, |el| {
+                                    el.rounded_tr(px(15.0)).rounded_br(px(15.0))
+                                })
                         })
                         .on_click(cx.listener(move |this, _, _, cx| this.pick_reasoning(level, cx)))
                         .child(

@@ -389,15 +389,25 @@ pub fn apply_keymap(
     }));
     let prefix = DEFAULT_LOADOUT_PREFIX;
     if bind_loadout {
-        cx.bind_keys((0..LOADOUT_SLOTS).filter_map(|slot| {
-            let combo = loadout_combo(prefix, slot);
-            let candidate = platform_combo(&combo);
-            if Keystroke::parse(&candidate).is_ok() {
-                Some(KeyBinding::new(&candidate, ActivateLoadout(slot), None))
-            } else {
-                None
-            }
-        }));
+        let mut bindings: Vec<_> = (0..LOADOUT_SLOTS)
+            .filter_map(|slot| {
+                let combo = loadout_combo(prefix, slot);
+                let candidate = platform_combo(&combo);
+                if Keystroke::parse(&candidate).is_ok() {
+                    Some(KeyBinding::new(&candidate, ActivateLoadout(slot), None))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        #[cfg(target_os = "macos")]
+        bindings.extend(
+            ["cmd-!", "cmd-@", "cmd-#", "cmd-$", "cmd-%"]
+                .into_iter()
+                .enumerate()
+                .map(|(slot, combo)| KeyBinding::new(combo, ActivateLoadout(slot), None)),
+        );
+        cx.bind_keys(bindings);
     }
 }
 
@@ -10938,10 +10948,13 @@ mod shortcut_focus_regressions {
     #[gpui::test]
     fn loadout_and_chat_number_shortcuts_dispatch_distinct_actions(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            cx.bind_keys([
-                KeyBinding::new(&platform_combo("mod-1"), JumpSession(0), None),
-                KeyBinding::new(&platform_combo("mod-shift-1"), ActivateLoadout(0), None),
-            ]);
+            apply_keymap(
+                cx,
+                &KeymapConfig::default(),
+                ComposerSendBehavior::default(),
+                DEFAULT_LOADOUT_PREFIX,
+                true,
+            );
         });
         let host = cx.add_window(|_, cx| ShortcutHost {
             root: cx.focus_handle(),
@@ -10955,11 +10968,16 @@ mod shortcut_focus_regressions {
             .unwrap();
 
         cx.simulate_keystrokes(host.into(), &platform_combo("mod-1"));
+        #[cfg(target_os = "macos")]
+        for combo in ["cmd-!", "cmd-@", "cmd-#", "cmd-$", "cmd-%"] {
+            cx.simulate_keystrokes(host.into(), combo);
+        }
+        #[cfg(not(target_os = "macos"))]
         cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-1"));
 
         host.update(cx, |host, _, _| {
             assert_eq!(host.jumps, 1);
-            assert_eq!(host.loadouts, 1);
+            assert_eq!(host.loadouts, if cfg!(target_os = "macos") { 5 } else { 1 });
         })
         .unwrap();
     }
