@@ -208,7 +208,7 @@ fn reasoning_meter_position(active_level: usize, level_count: usize) -> f32 {
     }
 }
 
-const REASONING_THUMB_RADIUS: f32 = 16.0;
+const REASONING_THUMB_RADIUS: f32 = 13.0;
 
 fn reasoning_thumb_center(width: f32, position: f32) -> f32 {
     REASONING_THUMB_RADIUS
@@ -519,6 +519,9 @@ pub struct Pickers {
     space_owner: Option<String>,
     device_owner: Option<String>,
     target_generation: u64,
+    /// Workspace-scoped model requests use their own generation so a slow
+    /// Pi reply cannot populate the next chat's catalog.
+    model_generation: u64,
     open: popover::Popup<PickerKind>,
     /// The harness/model picker's rail selection (loadouts vs the effective
     /// harness's list). Re-primed on every open.
@@ -617,22 +620,29 @@ impl Pickers {
         // the draft picks — they belonged to the previous chat/new-chat canvas.
         let state_observe = cx.observe(&state, |this: &mut Self, state, cx| {
             let selected = state.read(cx).selected_chat.clone();
-            if selected != this.draft_owner {
+            let chat_changed = selected != this.draft_owner;
+            if chat_changed {
                 this.draft_owner = selected;
+                this.model_generation = this.model_generation.wrapping_add(1);
+                this.models.clear();
+                this.catalog_rev = this.catalog_rev.wrapping_add(1);
                 this.config.harness = None;
                 this.config.model = None;
                 this.config.reasoning = None;
                 this.config.model_options.clear();
+                this.reasoning_motion = None;
                 this.switch_error = None;
             }
             // A space switch invalidates the branch draft + cache — the folder
             // (and possibly the device) changed under them.
             let space = state.read(cx).selected_space.clone();
             let device = state.read(cx).effective_device_id();
-            if space != this.space_owner || device != this.device_owner {
+            let workspace_changed = space != this.space_owner || device != this.device_owner;
+            if workspace_changed {
                 this.space_owner = space;
                 this.device_owner = device;
                 this.target_generation = this.target_generation.wrapping_add(1);
+                this.model_generation = this.model_generation.wrapping_add(1);
                 this.refs_task = None;
                 this.load_task = None;
                 this.config.branch = None;
@@ -644,6 +654,9 @@ impl Pickers {
                 this.harnesses = Loadable::Idle;
                 this.models.clear();
                 this.catalog_rev += 1;
+            }
+            if chat_changed || workspace_changed {
+                this.prefetch_models(false, cx);
             }
             cx.notify();
         });
@@ -687,6 +700,7 @@ impl Pickers {
             space_owner,
             device_owner,
             target_generation: 0,
+            model_generation: 0,
             config: DraftConfig::default(),
             defaults,
             data_dir,
@@ -1183,13 +1197,27 @@ impl Pickers {
             return;
         };
         let target = self.space_target(cx);
-        let generation = self.target_generation;
+        let cwd = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.clone())
+            .or_else(|| {
+                self.state
+                    .read(cx)
+                    .selected_space_row()
+                    .map(|space| space.path.clone())
+            });
+        let generation = self.model_generation;
         if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
             self.models.insert(harness, Loadable::Loading);
             self.catalog_rev += 1;
         }
         cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness });
+            if let (Some(cwd), Some(object)) = (&cwd, params.as_object_mut()) {
+                object.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
+            }
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
                 object.insert(
                     "targetDeviceId".into(),
@@ -1228,7 +1256,7 @@ impl Pickers {
                 cx.background_executor().timer(delay).await;
             }
             this.update(cx, |pickers, cx| {
-                if pickers.target_generation != generation {
+                if pickers.model_generation != generation {
                     return;
                 }
                 let loaded = match result {
@@ -1446,6 +1474,7 @@ impl Pickers {
             self.config.model = None;
             self.config.reasoning = None;
             self.config.model_options.clear();
+            self.reasoning_motion = None;
         }
         self.config.harness = Some(harness);
         self.defaults.harness = Some(harness);
@@ -1625,6 +1654,9 @@ impl Pickers {
                 config.model_options = options;
             });
         } else {
+            if self.effective_harness(cx) != Some(slot.harness) {
+                self.reasoning_motion = None;
+            }
             self.config.harness = Some(slot.harness);
             self.config.model = Some(slot.model.clone());
             self.config.reasoning = slot.reasoning;
@@ -3247,7 +3279,7 @@ impl Pickers {
         // Compact tabbed layout (user request, modeled on the referenced
         // picker): the model LIST gets a fixed band of roughly seven compact
         // rows; the pinned traits tray below sizes to its sections.
-        const LIST_HEIGHT: f32 = 216.0;
+        const LIST_HEIGHT: f32 = 248.0;
 
         let theme = Theme::of(cx).clone();
 
@@ -3824,46 +3856,60 @@ impl Pickers {
                 .to_string();
             let option_id = option.id.clone();
             let default_choice = option.default_choice.clone();
+            let horizontal = option.id.eq_ignore_ascii_case("contextWindow");
             sections.push(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(2.0)) // same rhythm as the Reasoning section above
                     .child(popover::menu_heading(&theme, &option.label))
-                    .children(
-                        option
-                            .choices
-                            .iter()
-                            .enumerate()
-                            .map(|(choice_ix, choice)| {
-                                let is_active = selected_choice == choice.id;
-                                let choice_id = choice.id.clone();
-                                let option_id = option_id.clone();
-                                let is_default = choice.id == default_choice;
-                                let mut row = popover::menu_row(
-                                    &theme,
-                                    is_active,
-                                    format!("trait-choice-{opt_ix}-{choice_ix}"),
-                                )
-                                .py(px(5.0))
-                                .rounded(px(6.0))
-                                .text_size(crate::typography::ui_rems(12.5))
-                                .id(("trait-choice", opt_ix * 32 + choice_ix))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.pick_option(
-                                        option_id.clone(),
-                                        choice_id.clone(),
-                                        is_default,
-                                        cx,
-                                    );
-                                }))
-                                .child(SharedString::from(choice.label.clone()));
-                                row = row.child(div().flex_1());
-                                if is_default {
-                                    row = row.child(default_badge(&theme));
-                                }
-                                row
-                            }),
+                    .child(
+                        div()
+                            .flex()
+                            .when(horizontal, |el| {
+                                el.debug_selector(|| "context-window-choices".into())
+                                    .flex_row()
+                                    .gap(px(4.0))
+                            })
+                            .when(!horizontal, |el| el.flex_col().gap(px(2.0)))
+                            .children(option.choices.iter().enumerate().map(
+                                |(choice_ix, choice)| {
+                                    let is_active = selected_choice == choice.id;
+                                    let choice_id = choice.id.clone();
+                                    let option_id = option_id.clone();
+                                    let is_default = choice.id == default_choice;
+                                    let mut row = popover::menu_row(
+                                        &theme,
+                                        is_active,
+                                        format!("trait-choice-{opt_ix}-{choice_ix}"),
+                                    )
+                                    .py(px(5.0))
+                                    .rounded(px(6.0))
+                                    .text_size(crate::typography::ui_rems(12.5))
+                                    .id(("trait-choice", opt_ix * 32 + choice_ix))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.pick_option(
+                                            option_id.clone(),
+                                            choice_id.clone(),
+                                            is_default,
+                                            cx,
+                                        );
+                                    }))
+                                    .child(SharedString::from(choice.label.clone()));
+                                    if horizontal {
+                                        row = row
+                                            .debug_selector(move || {
+                                                format!("context-window-choice-{choice_ix}").into()
+                                            })
+                                            .flex_1();
+                                    }
+                                    row = row.child(div().flex_1());
+                                    if is_default {
+                                        row = row.child(default_badge(&theme));
+                                    }
+                                    row
+                                },
+                            )),
                     )
                     .into_any_element(),
             );
@@ -3882,8 +3928,8 @@ impl Pickers {
         );
         let speed_button = div()
             .id("model-speed-toggle")
-            .size(px(32.0))
-            .rounded(px(8.0))
+            .size(px(28.0))
+            .rounded(px(7.0))
             .flex()
             .items_center()
             .justify_center()
@@ -3895,7 +3941,7 @@ impl Pickers {
             .when(!speed_available, |el| el.opacity(0.3))
             .child(
                 crate::icons::icon(crate::icons::SPEED)
-                    .size(px(17.0))
+                    .size(px(15.0))
                     .text_color(if speed_enabled {
                         theme.warning
                     } else {
@@ -3904,8 +3950,8 @@ impl Pickers {
             );
         let reset_button = div()
             .id("model-traits-reset")
-            .size(px(32.0))
-            .rounded(px(8.0))
+            .size(px(28.0))
+            .rounded(px(7.0))
             .flex()
             .items_center()
             .justify_center()
@@ -3917,7 +3963,7 @@ impl Pickers {
             .when(!reset_enabled, |el| el.opacity(0.3))
             .child(
                 crate::icons::icon(crate::icons::RESTART)
-                    .size(px(17.0))
+                    .size(px(15.0))
                     .text_color(theme.text_muted),
             );
         let target = reasoning_meter_position(active_level, levels.len());
@@ -3957,7 +4003,7 @@ impl Pickers {
             });
         }
         let reasoning_motion = self.reasoning_motion.clone().expect("initialized above");
-        let (to, epoch) = (reasoning_motion.to, reasoning_motion.epoch);
+        let to = reasoning_motion.to;
         let meter = (!levels.is_empty()).then(|| {
             let count = levels.len();
             let paint_motion = reasoning_motion.clone();
@@ -3966,8 +4012,9 @@ impl Pickers {
             let owner = cx.weak_entity();
             div()
                 .id("model-reasoning-meter")
+                .debug_selector(|| "model-reasoning-meter".into())
                 .relative()
-                .h(px(34.0))
+                .h(px(28.0))
                 .cursor_pointer()
                 .child(
                     gpui::canvas(
@@ -3987,7 +4034,7 @@ impl Pickers {
                             let center = reasoning_thumb_center(width, position);
                             let track = gpui::Bounds::new(
                                 bounds.origin + gpui::point(px(0.0), px(2.0)),
-                                gpui::size(bounds.size.width, px(30.0)),
+                                gpui::size(bounds.size.width, px(24.0)),
                             );
                             let rounded = |bounds, radius, color| {
                                 gpui::quad(
@@ -3999,7 +4046,7 @@ impl Pickers {
                                     gpui::BorderStyle::default(),
                                 )
                             };
-                            window.paint_quad(rounded(track, 15.0, crate::theme::ink(0.08)));
+                            window.paint_quad(rounded(track, 12.0, crate::theme::ink(0.08)));
                             // GPUI overflow masks are rectangular. Clip a full rounded
                             // track at the thumb center to preserve the capsule's edge.
                             window.with_content_mask(
@@ -4009,7 +4056,7 @@ impl Pickers {
                                         gpui::size(px(center), track.size.height),
                                     ),
                                 }),
-                                |window| window.paint_quad(rounded(track, 15.0, accent)),
+                                |window| window.paint_quad(rounded(track, 12.0, accent)),
                             );
                             for index in 0..count {
                                 let x = reasoning_thumb_center(
@@ -4017,15 +4064,15 @@ impl Pickers {
                                     reasoning_meter_position(index, count),
                                 );
                                 let dot = gpui::Bounds::new(
-                                    bounds.origin + gpui::point(px(x - 3.0), px(14.0)),
-                                    gpui::size(px(6.0), px(6.0)),
+                                    bounds.origin + gpui::point(px(x - 2.5), px(11.5)),
+                                    gpui::size(px(5.0), px(5.0)),
                                 );
-                                window.paint_quad(rounded(dot, 3.0, text.opacity(0.42)));
+                                window.paint_quad(rounded(dot, 2.5, text.opacity(0.42)));
                             }
                             let thumb = gpui::Bounds::new(
                                 bounds.origin
                                     + gpui::point(px(center - REASONING_THUMB_RADIUS), px(1.0)),
-                                gpui::size(px(32.0), px(32.0)),
+                                gpui::size(px(26.0), px(26.0)),
                             );
                             window.paint_quad(rounded(thumb, REASONING_THUMB_RADIUS, text));
                         },
@@ -4050,21 +4097,17 @@ impl Pickers {
             .text_size(crate::typography::ui_rems(13.0))
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .text_color(theme.accent)
-            .child(reasoning)
-            .with_animation(
-                SharedString::from(format!("reasoning-label-{epoch}")),
-                motion::MODEL_PICKER_CHANGE.animation(),
-                |el, t| el.relative().top(px(2.0 * (1.0 - t))).opacity(t),
-            );
+            .child(reasoning);
         sections.push(
             div()
                 .id("model-traits-bar")
+                .debug_selector(|| "model-traits-bar".into())
                 .px(px(8.0))
-                .pt(px(8.0))
-                .pb(px(10.0))
+                .pt(px(6.0))
+                .pb(px(6.0))
                 .flex()
                 .flex_col()
-                .gap(px(8.0))
+                .gap(px(5.0))
                 .child(
                     div()
                         .flex()
@@ -4080,8 +4123,8 @@ impl Pickers {
                                 .aria_expanded(self.model_expanded)
                                 .min_w_0()
                                 .px(px(6.0))
-                                .py(px(4.0))
-                                .rounded(px(8.0))
+                                .py(px(2.0))
+                                .rounded(px(7.0))
                                 .cursor_pointer()
                                 .hover(|style| style.bg(crate::theme::ink(0.06)))
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -4590,7 +4633,10 @@ impl Render for Pickers {
                         let (from, to, epoch) = (height.from, height.to, height.epoch);
                         div()
                             .overflow_hidden()
-                            .child(frame)
+                            .flex()
+                            .flex_col()
+                            .justify_end()
+                            .child(div().flex_none().child(frame))
                             .with_animation(
                                 SharedString::from(format!("model-picker-resize-{epoch}")),
                                 motion::MODEL_PICKER_CHANGE.animation(),
@@ -4794,6 +4840,21 @@ mod tests {
             picker.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
             let mut model = bare_model("one", "One");
             model.reasoning_levels = vec![ReasoningLevel::Low, ReasoningLevel::High];
+            model.options = vec![ModelOption {
+                id: "contextWindow".into(),
+                label: "Context Window".into(),
+                default_choice: "200k".into(),
+                choices: vec![
+                    ModelOptionChoice {
+                        id: "200k".into(),
+                        label: "200K".into(),
+                    },
+                    ModelOptionChoice {
+                        id: "1m".into(),
+                        label: "1M".into(),
+                    },
+                ],
+            }];
             picker
                 .models
                 .insert(HarnessId::Codex, Loadable::Ready(vec![model]));
@@ -4804,6 +4865,16 @@ mod tests {
         });
         cx.refresh().unwrap();
         assert!(cx.debug_bounds("model-details").is_some());
+        let collapsed_bar = cx.debug_bounds("model-traits-bar").unwrap();
+        assert_eq!(
+            f32::from(
+                cx.debug_bounds("model-reasoning-meter")
+                    .unwrap()
+                    .size
+                    .height
+            ),
+            28.0
+        );
         for selector in ["model-list", "model-providers", "model-search"] {
             assert!(
                 cx.debug_bounds(selector).is_none(),
@@ -4814,6 +4885,18 @@ mod tests {
         pickers.read_with(cx, |picker, _| assert!(!picker.model_expanded));
         cx.simulate_keystrokes("enter");
         cx.refresh().unwrap();
+        let expanded_bar = cx.debug_bounds("model-traits-bar").unwrap();
+        let first_window = cx.debug_bounds("context-window-choice-0").unwrap();
+        let second_window = cx.debug_bounds("context-window-choice-1").unwrap();
+        assert_eq!(first_window.origin.y, second_window.origin.y);
+        assert!(first_window.origin.x < second_window.origin.x);
+        assert!(
+            (f32::from(collapsed_bar.origin.y + collapsed_bar.size.height)
+                - f32::from(expanded_bar.origin.y + expanded_bar.size.height))
+            .abs()
+                < 0.5,
+            "the fixed reasoning bar must stay bottom-anchored"
+        );
         for selector in ["model-list", "model-providers", "model-search"] {
             assert!(
                 cx.debug_bounds(selector).is_some(),
@@ -5252,9 +5335,12 @@ mod tests {
         assert_eq!(reasoning_meter_position(0, 0), 0.0);
         assert_eq!(reasoning_meter_position(0, 1), 0.5);
         for width in [160.0, 276.0, 500.0] {
-            assert_eq!(reasoning_thumb_center(width, 0.0), 16.0);
+            assert_eq!(reasoning_thumb_center(width, 0.0), REASONING_THUMB_RADIUS);
             assert_eq!(reasoning_thumb_center(width, 0.5), width / 2.0);
-            assert_eq!(reasoning_thumb_center(width, 1.0), width - 16.0);
+            assert_eq!(
+                reasoning_thumb_center(width, 1.0),
+                width - REASONING_THUMB_RADIUS
+            );
             for count in 1..=9 {
                 for index in 0..count {
                     let center =
