@@ -201,11 +201,26 @@ pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
 }
 
 fn reasoning_meter_position(active_level: usize, level_count: usize) -> f32 {
-    if level_count == 0 {
-        0.0
-    } else {
-        (active_level as f32 + 0.5) / level_count as f32
+    match level_count {
+        0 => 0.0,
+        1 => 0.5,
+        count => active_level.min(count - 1) as f32 / (count - 1) as f32,
     }
+}
+
+const REASONING_THUMB_RADIUS: f32 = 16.0;
+
+fn reasoning_thumb_center(width: f32, position: f32) -> f32 {
+    REASONING_THUMB_RADIUS
+        + (width - 2.0 * REASONING_THUMB_RADIUS).max(0.0) * position.clamp(0.0, 1.0)
+}
+
+fn reasoning_level_at(width: f32, x: f32, count: usize) -> usize {
+    let travel = width - 2.0 * REASONING_THUMB_RADIUS;
+    if count <= 1 || travel <= 0.0 {
+        return 0;
+    }
+    (((x - REASONING_THUMB_RADIUS) / travel).clamp(0.0, 1.0) * (count - 1) as f32).round() as usize
 }
 
 fn picker_frame_height(child_heights: &[f32]) -> f32 {
@@ -548,6 +563,8 @@ pub struct Pickers {
     /// Last mid-session switch failure (shown in the ref popover).
     switch_error: Option<String>,
     mutate_task: Option<Task<()>>,
+    reasoning_bounds: gpui::Bounds<gpui::Pixels>,
+    model_expanded: bool,
     reasoning_motion: Option<ScalarMotion>,
     model_picker_height_motion: Option<ScalarMotion>,
     _search_events: Subscription,
@@ -695,6 +712,8 @@ impl Pickers {
             switch_task: None,
             switch_error: None,
             mutate_task: None,
+            reasoning_bounds: gpui::Bounds::default(),
+            model_expanded: false,
             reasoning_motion: None,
             model_picker_height_motion: None,
             _search_events: search_events,
@@ -963,6 +982,7 @@ impl Pickers {
             return;
         }
         self.open.open(kind);
+        self.model_expanded = false;
         // Clearing stale text emits Edited AFTER this function returns —
         // mute that one event so its reset can't clobber the highlight
         // anchored below (the no-op clear is also skipped for the same
@@ -1034,7 +1054,7 @@ impl Pickers {
                 window.focus(&handle, cx);
             }
             PickerKind::HarnessModel => {
-                let handle = self.search.read(cx).focus_handle(cx);
+                let handle = self.focus.clone();
                 self.search.update(cx, |input, cx| {
                     input.set_placeholder("Search models…", cx);
                 });
@@ -1437,6 +1457,17 @@ impl Pickers {
         cx.notify();
     }
 
+    fn toggle_model_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.model_expanded = !self.model_expanded;
+        let focus = if self.model_expanded {
+            self.search.read(cx).focus_handle(cx)
+        } else {
+            self.focus.clone()
+        };
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
         // The card stays open on a pick (user request): model and traits
         // share one popover now, and adjusting the tray right after choosing
@@ -1461,6 +1492,25 @@ impl Pickers {
             }
         }
         cx.notify();
+    }
+
+    fn pick_reasoning_at(
+        &mut self,
+        point: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let levels = self.trait_ladder(cx);
+        let index = reasoning_level_at(
+            f32::from(self.reasoning_bounds.size.width),
+            f32::from(point.x - self.reasoning_bounds.origin.x),
+            levels.len(),
+        );
+        if let Some(&level) = levels.get(index)
+            && self.effective_reasoning(cx) != Some(level)
+        {
+            self.pick_reasoning(level, cx);
+        }
     }
 
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {
@@ -1767,6 +1817,9 @@ impl Pickers {
 
     /// Enter on the harness/model popover: pick the highlighted model.
     fn activate_model_row(&mut self, cx: &mut Context<Self>) {
+        if !self.model_expanded {
+            return;
+        }
         self.activate_model_index(self.active, cx);
     }
 
@@ -2249,7 +2302,7 @@ impl Pickers {
         }
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // The frame stays mounted (and possibly focused) through the exit
         // animation — keys must not drive a dying popover.
         if !self.open.is_open() {
@@ -2260,6 +2313,13 @@ impl Pickers {
             event.keystroke.modifiers.platform,
             event.keystroke.modifiers.control,
         );
+        if self.is_model_menu_open() && !self.model_expanded && key != MenuKey::Escape {
+            if key == MenuKey::Enter || event.keystroke.key == "space" {
+                self.toggle_model_details(window, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
         let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
         match key {
             MenuKey::Escape => {
@@ -3272,6 +3332,7 @@ impl Pickers {
         //    hairline. Tabs never hide: a live search only filters the
         //    viewed tab's list, so switching tabs re-scopes the same query.
         let mut tabs = div()
+            .debug_selector(|| "model-providers".into())
             .flex_none()
             .h(px(40.0))
             .px(px(6.0))
@@ -3355,6 +3416,7 @@ impl Pickers {
         //    The placeholder names the scope — the query never leaves the
         //    viewed tab (user request; the old global search hid the rail).
         let search_row = div()
+            .debug_selector(|| "model-search".into())
             .flex_none()
             .h(px(40.0))
             .px(px(10.0))
@@ -3479,6 +3541,7 @@ impl Pickers {
         let model_scrollbar = self.render_model_scrollbar(&theme, cx);
         let list_host = div()
             .id("model-list-scroll-host")
+            .debug_selector(|| "model-list".into())
             .relative()
             .flex_none()
             .h(px(LIST_HEIGHT))
@@ -3505,16 +3568,13 @@ impl Pickers {
             .children(model_scrollbar);
 
         // ── controls: pinned to the selector's bottom edge.
-        let has_tray = !self.trait_ladder(cx).is_empty()
-            || self
-                .selected_model(cx)
-                .is_some_and(|m| !m.options.is_empty());
+        let has_tray = self.selected_model(cx).is_some();
         let tray: Option<AnyElement> = has_tray.then(|| {
             let sections = self.render_traits_sections(cx);
             div()
                 .id("model-traits-tray")
                 .flex_none()
-                .border_t_1()
+                .when(self.model_expanded, |el| el.border_t_1())
                 .border_color(crate::theme::hairline(0.08))
                 // Long option stacks scroll inside the tray rather than
                 // growing the card past the viewport.
@@ -3526,7 +3586,8 @@ impl Pickers {
                 .into_any_element()
         });
         let layout_identity = format!(
-            "{:?}:{:?}:{}",
+            "{}:{:?}:{:?}:{}",
+            self.model_expanded,
             self.model_rail,
             effective,
             self.selected_model(cx)
@@ -3538,9 +3599,9 @@ impl Pickers {
         div()
             .flex()
             .flex_col()
-            .child(list_host)
-            .child(search_row)
-            .child(tabs)
+            .when(self.model_expanded || !has_tray, |el| {
+                el.child(list_host).child(search_row).child(tabs)
+            })
             .children(tray)
             .on_children_prepainted(move |bounds, _, cx| {
                 let heights = bounds
@@ -3747,6 +3808,9 @@ impl Pickers {
         let reset_enabled = current != default_level || !selections.is_empty();
         let mut sections: Vec<AnyElement> = Vec::new();
         for (opt_ix, option) in model.options.iter().enumerate() {
+            if !self.model_expanded {
+                break;
+            }
             if speed.as_ref().is_some_and(|speed| speed.id == option.id) {
                 continue;
             }
@@ -3893,98 +3957,99 @@ impl Pickers {
             });
         }
         let reasoning_motion = self.reasoning_motion.clone().expect("initialized above");
-        let (from, to, epoch) = (
-            reasoning_motion.from,
-            reasoning_motion.to,
-            reasoning_motion.epoch,
-        );
+        let (to, epoch) = (reasoning_motion.to, reasoning_motion.epoch);
         let meter = (!levels.is_empty()).then(|| {
-            let fill = div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left_0()
-                .bg(theme.accent.opacity(0.72))
-                .with_animation(
-                    SharedString::from(format!("reasoning-fill-{epoch}")),
-                    motion::MODEL_PICKER_CHANGE.animation(),
-                    move |el, t| el.w(gpui::relative(motion::lerp(from, to, t))),
-                );
-            let fill_cap = div()
-                .absolute()
-                .top_0()
-                .size(px(30.0))
-                .ml(px(-15.0))
-                .rounded(px(15.0))
-                .bg(theme.accent.opacity(0.72))
-                .with_animation(
-                    SharedString::from(format!("reasoning-fill-cap-{epoch}")),
-                    motion::MODEL_PICKER_CHANGE.animation(),
-                    move |el, t| el.left(gpui::relative(motion::lerp(from, to, t))),
-                );
-            let thumb = div()
-                .absolute()
-                .top(px(-1.0))
-                .size(px(32.0))
-                .ml(px(-16.0))
-                .rounded(px(16.0))
-                .bg(theme.text)
-                .with_animation(
-                    SharedString::from(format!("reasoning-thumb-{epoch}")),
-                    motion::MODEL_PICKER_CHANGE.animation(),
-                    move |el, t| el.left(gpui::relative(motion::lerp(from, to, t))),
-                );
+            let count = levels.len();
+            let paint_motion = reasoning_motion.clone();
+            let accent = theme.accent.opacity(0.72);
+            let text = theme.text;
+            let owner = cx.weak_entity();
             div()
                 .id("model-reasoning-meter")
                 .relative()
-                .h(px(30.0))
-                .rounded(px(15.0))
-                .overflow_hidden()
-                .bg(crate::theme::ink(0.08))
-                .child(fill)
-                .child(fill_cap)
+                .h(px(34.0))
+                .cursor_pointer()
                 .child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .children((0..levels.len()).map(|index| {
-                            div()
-                                .id(("reasoning-dot", index))
-                                .flex_1()
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .size(px(6.0))
-                                        .rounded(px(3.0))
-                                        .bg(theme.text.opacity(0.42)),
+                    gpui::canvas(
+                        move |bounds, _, cx| {
+                            let _ = owner.update(cx, |this, _| this.reasoning_bounds = bounds);
+                        },
+                        move |bounds, _, window, cx| {
+                            let position = if cx.reduce_motion() {
+                                to
+                            } else {
+                                paint_motion.value(Instant::now())
+                            };
+                            if position != to {
+                                window.request_animation_frame();
+                            }
+                            let width = f32::from(bounds.size.width);
+                            let center = reasoning_thumb_center(width, position);
+                            let track = gpui::Bounds::new(
+                                bounds.origin + gpui::point(px(0.0), px(2.0)),
+                                gpui::size(bounds.size.width, px(30.0)),
+                            );
+                            let rounded = |bounds, radius, color| {
+                                gpui::quad(
+                                    bounds,
+                                    px(radius),
+                                    color,
+                                    px(0.0),
+                                    gpui::transparent_black(),
+                                    gpui::BorderStyle::default(),
                                 )
-                        })),
+                            };
+                            window.paint_quad(rounded(track, 15.0, crate::theme::ink(0.08)));
+                            // GPUI overflow masks are rectangular. Clip a full rounded
+                            // track at the thumb center to preserve the capsule's edge.
+                            window.with_content_mask(
+                                Some(gpui::ContentMask {
+                                    bounds: gpui::Bounds::new(
+                                        track.origin,
+                                        gpui::size(px(center), track.size.height),
+                                    ),
+                                }),
+                                |window| window.paint_quad(rounded(track, 15.0, accent)),
+                            );
+                            for index in 0..count {
+                                let x = reasoning_thumb_center(
+                                    width,
+                                    reasoning_meter_position(index, count),
+                                );
+                                let dot = gpui::Bounds::new(
+                                    bounds.origin + gpui::point(px(x - 3.0), px(14.0)),
+                                    gpui::size(px(6.0), px(6.0)),
+                                );
+                                window.paint_quad(rounded(dot, 3.0, text.opacity(0.42)));
+                            }
+                            let thumb = gpui::Bounds::new(
+                                bounds.origin
+                                    + gpui::point(px(center - REASONING_THUMB_RADIUS), px(1.0)),
+                                gpui::size(px(32.0), px(32.0)),
+                            );
+                            window.paint_quad(rounded(thumb, REASONING_THUMB_RADIUS, text));
+                        },
+                    )
+                    .size_full(),
                 )
-                .child(thumb)
-                .child(div().absolute().inset_0().flex().children(
-                    levels.into_iter().enumerate().map(|(index, level)| {
-                        div()
-                            .id(("reasoning-segment", index))
-                            .flex_1()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.pick_reasoning(level, cx)),
-                            )
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                        this.pick_reasoning_at(event.position, window, cx);
                     }),
-                ))
+                )
+                .on_mouse_move(
+                    cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                        if event.dragging() {
+                            this.pick_reasoning_at(event.position, window, cx);
+                        }
+                    }),
+                )
         });
         let reasoning_text = div()
             .text_size(crate::typography::ui_rems(13.0))
             .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_color(theme.text)
+            .text_color(theme.accent)
             .child(reasoning)
             .with_animation(
                 SharedString::from(format!("reasoning-label-{epoch}")),
@@ -4008,12 +4073,39 @@ impl Pickers {
                         .child(speed_button)
                         .child(
                             div()
+                                .id("model-details-toggle")
+                                .debug_selector(|| "model-details".into())
+                                .role(gpui::Role::Button)
+                                .aria_label("Choose model")
+                                .aria_expanded(self.model_expanded)
                                 .min_w_0()
-                                .flex_1()
+                                .px(px(6.0))
+                                .py(px(4.0))
+                                .rounded(px(8.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(crate::theme::ink(0.06)))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_model_details(window, cx)
+                                }))
                                 .flex()
                                 .flex_col()
                                 .items_center()
-                                .child(reasoning_text)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(3.0))
+                                        .child(reasoning_text)
+                                        .child(
+                                            crate::icons::icon(if self.model_expanded {
+                                                crate::icons::ALT_ARROW_DOWN
+                                            } else {
+                                                crate::icons::ALT_ARROW_RIGHT
+                                            })
+                                            .size(px(13.0))
+                                            .text_color(theme.text_muted),
+                                        ),
+                                )
                                 .child(
                                     div()
                                         .mt(px(1.0))
@@ -4652,6 +4744,110 @@ mod tests {
     }
 
     #[gpui::test]
+    fn model_details_start_collapsed_and_keep_hidden_rows_inactive(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Pickers::new(state, cx)
+        });
+        handle
+            .update(cx, |pickers, window, cx| {
+                pickers.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+                pickers.models.insert(
+                    HarnessId::Codex,
+                    Loadable::Ready(vec![bare_model("one", "One"), bare_model("two", "Two")]),
+                );
+                pickers.config.harness = Some(HarnessId::Codex);
+                pickers.config.model = Some("one".into());
+                pickers.open_model_menu(window, cx);
+                assert!(!pickers.model_expanded);
+                assert!(pickers.focus.is_focused(window));
+                pickers.active = 1;
+                pickers.on_search_submit(cx);
+                assert_eq!(pickers.config.model.as_deref(), Some("one"));
+                pickers.toggle_model_details(window, cx);
+                assert!(pickers.model_expanded);
+                assert!(pickers.search.read(cx).focus_handle(cx).is_focused(window));
+                pickers.on_search_submit(cx);
+                assert_eq!(pickers.config.model.as_deref(), Some("two"));
+                pickers.toggle_model_details(window, cx);
+                assert!(!pickers.model_expanded);
+                assert!(pickers.focus.is_focused(window));
+                assert_eq!(pickers.config.model.as_deref(), Some("two"));
+                pickers.toggle_model_details(window, cx);
+                pickers.dismiss(cx);
+                pickers.open_model_menu(window, cx);
+                assert!(!pickers.model_expanded);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn model_details_render_and_keyboard_disclosure(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            cx.set_reduce_motion(true);
+        });
+        let (pickers, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|_| AppState::new());
+            let mut picker = Pickers::new(state, cx);
+            picker.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+            let mut model = bare_model("one", "One");
+            model.reasoning_levels = vec![ReasoningLevel::Low, ReasoningLevel::High];
+            picker
+                .models
+                .insert(HarnessId::Codex, Loadable::Ready(vec![model]));
+            picker.config.harness = Some(HarnessId::Codex);
+            picker.config.model = Some("one".into());
+            picker.open_model_menu(window, cx);
+            picker
+        });
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("model-details").is_some());
+        for selector in ["model-list", "model-providers", "model-search"] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{selector} must be hidden"
+            );
+        }
+        cx.simulate_keystrokes("down");
+        pickers.read_with(cx, |picker, _| assert!(!picker.model_expanded));
+        cx.simulate_keystrokes("enter");
+        cx.refresh().unwrap();
+        for selector in ["model-list", "model-providers", "model-search"] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} must be visible"
+            );
+        }
+        let button = cx.debug_bounds("model-details").unwrap();
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.refresh().unwrap();
+        for selector in ["model-list", "model-providers", "model-search"] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{selector} must be hidden"
+            );
+        }
+        let button = cx.debug_bounds("model-details").unwrap();
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.refresh().unwrap();
+        assert!(cx.debug_bounds("model-list").is_some());
+        let button = cx.debug_bounds("model-details").unwrap();
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.simulate_keystrokes("space");
+        cx.refresh().unwrap();
+        for selector in ["model-list", "model-providers", "model-search"] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} must be visible"
+            );
+        }
+        cx.simulate_keystrokes("escape");
+        pickers.read_with(cx, |picker, _| assert!(!picker.is_open()));
+    }
+
+    #[gpui::test]
     fn projectless_picker_clears_checkout_and_supports_keyboard_selection(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -5049,8 +5245,26 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_cap_and_thumb_share_the_same_center() {
-        assert_eq!(reasoning_meter_position(5, 7), 5.5 / 7.0);
+    fn reasoning_fill_thumb_and_hit_testing_share_geometry() {
+        assert_eq!(reasoning_meter_position(0, 7), 0.0);
+        assert_eq!(reasoning_meter_position(3, 7), 0.5);
+        assert_eq!(reasoning_meter_position(6, 7), 1.0);
+        assert_eq!(reasoning_meter_position(0, 0), 0.0);
+        assert_eq!(reasoning_meter_position(0, 1), 0.5);
+        for width in [160.0, 276.0, 500.0] {
+            assert_eq!(reasoning_thumb_center(width, 0.0), 16.0);
+            assert_eq!(reasoning_thumb_center(width, 0.5), width / 2.0);
+            assert_eq!(reasoning_thumb_center(width, 1.0), width - 16.0);
+            for count in 1..=9 {
+                for index in 0..count {
+                    let center =
+                        reasoning_thumb_center(width, reasoning_meter_position(index, count));
+                    assert_eq!(reasoning_level_at(width, center, count), index);
+                }
+                assert_eq!(reasoning_level_at(width, -10.0, count), 0);
+                assert_eq!(reasoning_level_at(width, width + 10.0, count), count - 1);
+            }
+        }
     }
 
     #[test]
