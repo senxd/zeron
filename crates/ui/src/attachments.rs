@@ -164,8 +164,12 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
 /// for a user message ("Attached image" / "N attached images" when image-only).
 pub fn user_message_rail_text(content: &str) -> String {
     let parsed = parse_user_message_images(content);
-    if !parsed.text.trim().is_empty() {
-        return parsed.text;
+    let (text, badges) = crate::badges::split(&parsed.text);
+    if !text.trim().is_empty() {
+        return text;
+    }
+    if let Some(badge) = badges.first() {
+        return badge.label.to_string();
     }
     match parsed.attachments.len() {
         0 => content.to_string(),
@@ -651,12 +655,12 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
             // resolves the rewritten ref instantly instead of blanking the
             // thumbnail into a skeleton while the bytes round-trip
             // (2026-08-19 "photo disappears after it finishes sending").
-            if let Some(image) = upload_alias_id8(path)
-                .and_then(|id8| match cache.map.get(&alias_key(device_id, &id8)) {
+            if let Some(image) = upload_alias_id8(path).and_then(|id8| {
+                match cache.map.get(&alias_key(device_id, &id8)) {
                     Some(CacheEntry::Loaded { image, .. }) => Some(image.clone()),
                     _ => None,
-                })
-            {
+                }
+            }) {
                 cache.insert_loaded(key(device_id, path), image.clone());
                 return AttachmentSnapshot::Loaded(image);
             }
@@ -671,9 +675,8 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
 fn upload_alias_id8(path: &str) -> Option<String> {
     let base = std::path::Path::new(path).file_name()?.to_str()?;
     let (id8, _) = base.split_at_checked(8)?;
-    (base.as_bytes().get(8) == Some(&b'-')
-        && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
-    .then(|| id8.to_string())
+    (base.as_bytes().get(8) == Some(&b'-') && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| id8.to_string())
 }
 
 fn alias_key(device_id: &str, id8: &str) -> (String, String) {
@@ -896,6 +899,19 @@ mod tests {
         let with_text = with_attachments("fix this", &["/a/b.png".to_string()]);
         assert_eq!(user_message_rail_text(&with_text), "fix this");
         assert_eq!(user_message_rail_text("plain"), "plain");
+        let annotated = crate::annotations::with_annotations(
+            "",
+            &[crate::annotations::TranscriptAnnotation {
+                id: "a".into(),
+                message_id: "m".into(),
+                text: "quoted".into(),
+                comment: String::new(),
+                start_offset: 0,
+                end_offset: 6,
+                spans: Vec::new(),
+            }],
+        );
+        assert_eq!(user_message_rail_text(&annotated), "1 annotation");
     }
 
     #[test]
@@ -955,7 +971,10 @@ mod tests {
         // Exact multiple: no trailing empty chunk.
         let exact = chunk_ranges(UPLOAD_CHUNK_B64_CHARS * 2);
         assert_eq!(exact.len(), 2);
-        assert_eq!(exact[1], (1, UPLOAD_CHUNK_B64_CHARS..UPLOAD_CHUNK_B64_CHARS * 2));
+        assert_eq!(
+            exact[1],
+            (1, UPLOAD_CHUNK_B64_CHARS..UPLOAD_CHUNK_B64_CHARS * 2)
+        );
         // Partial tail.
         let partial = chunk_ranges(UPLOAD_CHUNK_B64_CHARS + 7);
         assert_eq!(partial.len(), 2);

@@ -1426,6 +1426,9 @@ impl Shell {
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
             move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+                ComposerEvent::AnnotationsCleared { .. } => {
+                    transcript.update(cx, |t, cx| t.dismiss_annotation_draft(cx));
+                }
                 ComposerEvent::Sent {
                     chat_id,
                     message_id,
