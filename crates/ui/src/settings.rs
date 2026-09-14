@@ -726,13 +726,27 @@ impl KeymapConfig {
     }
 
     /// Restore persisted shortcuts that collide with fixed app bindings.
-    fn heal_reserved_shortcuts(&mut self) {
+    fn heal_reserved_shortcuts(&mut self, loadout: &LoadoutConfig) {
         for id in ShortcutId::ALL {
-            if self.get(id) == "mod-enter" || loadout_model::is_fixed_loadout_combo(self.get(id)) {
+            if platform_combo(self.get(id)) == platform_combo("mod-enter")
+                || loadout_model::loadout_shortcut_owner(
+                    cfg!(target_os = "macos"),
+                    loadout,
+                    usize::MAX,
+                    self.get(id),
+                )
+                .is_some()
+            {
                 let default = id.default_combo();
-                let default_is_taken = ShortcutId::ALL
-                    .into_iter()
-                    .any(|other| other != id && self.get(other) == default);
+                let default_is_taken = ShortcutId::ALL.into_iter().any(|other| {
+                    other != id && platform_combo(self.get(other)) == platform_combo(default)
+                }) || loadout_model::loadout_shortcut_owner(
+                    cfg!(target_os = "macos"),
+                    loadout,
+                    usize::MAX,
+                    default,
+                )
+                .is_some();
                 self.set(
                     id,
                     (!default_is_taken).then_some(default).unwrap_or("").into(),
@@ -860,6 +874,19 @@ pub fn platform_combo_on(mac: bool, combo: &str) -> String {
         .join("-")
 }
 
+fn display_combo_parts(combo: &str) -> Vec<&str> {
+    if combo == "-" {
+        return vec!["-"];
+    }
+    if let Some(modifiers) = combo.strip_suffix("--") {
+        let mut parts: Vec<_> = modifiers.split('-').collect();
+        parts.push("-");
+        parts
+    } else {
+        combo.split('-').collect()
+    }
+}
+
 /// Human-readable combo for the shortcuts table ("mod-s" → "Cmd+S"/"Ctrl+S").
 pub fn display_combo(combo: &str) -> String {
     display_combo_on(cfg!(target_os = "macos"), combo)
@@ -867,8 +894,8 @@ pub fn display_combo(combo: &str) -> String {
 
 /// [`display_combo`] for an explicit platform (see [`combo_from_keystroke_on`]).
 pub fn display_combo_on(mac: bool, combo: &str) -> String {
-    combo
-        .split('-')
+    display_combo_parts(combo)
+        .into_iter()
         .map(|part| match part {
             "mod" => if mac { "Cmd" } else { "Ctrl" }.to_string(),
             "alt" => if mac { "Opt" } else { "Alt" }.to_string(),
@@ -898,7 +925,7 @@ pub fn badge_combo_on(mac: bool, combo: &str) -> String {
     if !mac {
         return display_combo_on(false, combo);
     }
-    let mut parts: Vec<&str> = combo.split('-').collect();
+    let mut parts = display_combo_parts(combo);
     let key = parts.pop().unwrap_or("");
     let mut out = String::new();
     for glyph in ["ctrl", "alt", "shift", "mod"]
@@ -950,8 +977,8 @@ impl UiSettings {
         self.git_history_column_order = self.git_history_column_order.normalized();
         self.ui_font_size = self.ui_font_size.normalized();
         self.keymap.heal_jump_slots();
-        self.keymap.heal_reserved_shortcuts();
         self.loadout = self.loadout.clamped();
+        self.keymap.heal_reserved_shortcuts(&self.loadout);
         self
     }
 
@@ -1819,6 +1846,25 @@ mod tests {
     }
 
     #[test]
+    fn freed_loadout_shortcut_survives_settings_reload() {
+        let mut settings = UiSettings::default();
+        settings.loadout.slots[0] = Some(LoadoutSlot {
+            harness: zeron_proto::HarnessId::Codex,
+            model: "model".into(),
+            label: "Model".into(),
+            reasoning: None,
+            model_options: Default::default(),
+            shortcut: Some("mod-shift-h".into()),
+        });
+        settings.keymap.toggle_terminal = "mod-shift-1".into();
+        let settings = settings.clamped();
+        assert_eq!(settings.keymap.toggle_terminal, "mod-shift-1");
+        let loaded: UiSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.clamped().keymap.toggle_terminal, "mod-shift-1");
+    }
+
+    #[test]
     fn fixed_loadout_shortcuts_heal_persisted_conflicts() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1881,6 +1927,15 @@ mod tests {
         assert!(!modifier_send_hint_visible(false, false, false));
         assert!(!modifier_send_hint_visible(true, true, false));
         assert!(!modifier_send_hint_visible(true, false, true));
+    }
+
+    #[test]
+    fn literal_minus_shortcut_displays_its_key() {
+        assert_eq!(display_combo_on(true, "mod--"), "Cmd+-");
+        assert_eq!(display_combo_on(false, "mod--"), "Ctrl+-");
+        assert_eq!(badge_combo_on(true, "mod--"), "⌘-");
+        assert_eq!(badge_combo_on(false, "mod--"), "Ctrl+-");
+        assert_eq!(badge_combo_on(true, "mod-shift--"), "⇧⌘-");
     }
 
     #[test]

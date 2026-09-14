@@ -8,9 +8,12 @@ use gpui::{
     prelude::*, px,
 };
 
-use crate::settings::loadout_model::is_fixed_loadout_combo;
+use crate::settings::loadout_model::{
+    LoadoutConfig, keymap_shortcut_conflict, loadout_shortcut_owner, reserved_loadout_combo,
+};
 use crate::settings::{
-    ComposerSendBehavior, KeymapConfig, ShortcutId, combo_from_keystroke, display_combo,
+    ComposerSendBehavior, KeymapConfig, LOADOUT_SLOTS, ShortcutId, combo_from_keystroke,
+    display_combo,
 };
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -51,6 +54,7 @@ pub struct ShortcutsPage {
     keymap: KeymapConfig,
     escape_stops_active_agent: bool,
     composer_send_behavior: ComposerSendBehavior,
+    loadout: LoadoutConfig,
     recording: Option<ShortcutId>,
     /// A rejected record attempt ("{Combo} is already assigned to {label}.") —
     /// conflicts never persist; they're refused at record time, as in zeron.
@@ -69,12 +73,14 @@ impl ShortcutsPage {
         keymap: KeymapConfig,
         escape_stops_active_agent: bool,
         composer_send_behavior: ComposerSendBehavior,
+        loadout: LoadoutConfig,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
             keymap,
             escape_stops_active_agent,
             composer_send_behavior,
+            loadout,
             recording: None,
             conflict_notice: None,
             focus: cx.focus_handle(),
@@ -84,6 +90,11 @@ impl ShortcutsPage {
 
     fn commit(&mut self, cx: &mut Context<Self>) {
         cx.emit(ShortcutsEvent::KeymapChanged(self.keymap.clone()));
+        cx.notify();
+    }
+
+    pub fn set_loadout(&mut self, loadout: LoadoutConfig, cx: &mut Context<Self>) {
+        self.loadout = loadout;
         cx.notify();
     }
 
@@ -135,9 +146,29 @@ impl ShortcutsPage {
                     cx.stop_propagation();
                     return;
                 }
-                if is_fixed_loadout_combo(&combo) {
-                    self.conflict_notice =
-                        Some(format!("{} is reserved for loadouts.", display_combo(&combo)).into());
+                if let Some(owner) = reserved_loadout_combo(cfg!(target_os = "macos"), &combo) {
+                    self.conflict_notice = Some(
+                        format!("{} is reserved for {}.", display_combo(&combo), owner).into(),
+                    );
+                    self.recording = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                    return;
+                }
+                if let Some(slot) = loadout_shortcut_owner(
+                    cfg!(target_os = "macos"),
+                    &self.loadout,
+                    LOADOUT_SLOTS,
+                    &combo,
+                ) {
+                    self.conflict_notice = Some(
+                        format!(
+                            "{} is already assigned to loadout slot {}.",
+                            display_combo(&combo),
+                            slot + 1
+                        )
+                        .into(),
+                    );
                     self.recording = None;
                     cx.notify();
                     cx.stop_propagation();
@@ -278,9 +309,7 @@ impl ShortcutsPage {
 
 /// The shortcut (other than `id`) already bound to `combo`, if any. Pure.
 pub fn conflict_owner(keymap: &KeymapConfig, id: ShortcutId, combo: &str) -> Option<ShortcutId> {
-    ShortcutId::ALL
-        .into_iter()
-        .find(|&other| other != id && keymap.get(other) == combo)
+    keymap_shortcut_conflict(cfg!(target_os = "macos"), keymap, combo, Some(id))
 }
 
 pub fn send_combo_is_reserved(_behavior: ComposerSendBehavior, combo: &str) -> bool {
@@ -610,6 +639,7 @@ impl Render for ShortcutsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::loadout_model::is_fixed_loadout_combo;
 
     #[test]
     fn recording_outcomes() {

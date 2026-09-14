@@ -1,8 +1,7 @@
 //! Loadout slots and the shared activation-prefix chord.
 //!
-//! Five slots, activated by `{prefix}-1` … `{prefix}-5`. The default prefix is
-//! `mod-shift` (Cmd+Shift on macOS, Ctrl+Shift elsewhere). Recording captures
-//! the modifiers from a full keystroke and keeps the slot numbers.
+//! Five slots, activated by `{prefix}-1` … `{prefix}-5` by default. Each slot
+//! may override that binding or explicitly disable it.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +26,10 @@ pub struct LoadoutSlot {
     pub reasoning: Option<ReasoningLevel>,
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    /// A platform-neutral override. `None` uses the slot's default activation
+    /// combo; `Some("")` intentionally disables the slot shortcut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortcut: Option<String>,
 }
 
 /// Persisted loadout: a shared prefix plus five slots (trailing empties allowed).
@@ -35,6 +38,10 @@ pub struct LoadoutSlot {
 pub struct LoadoutConfig {
     pub prefix: String,
     pub slots: Vec<Option<LoadoutSlot>>,
+    /// Device-local provider column order. Unknown and hidden keys remain
+    /// persisted so a provider returns to its previous position.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_order: Vec<String>,
 }
 
 impl Default for LoadoutConfig {
@@ -42,6 +49,7 @@ impl Default for LoadoutConfig {
         Self {
             prefix: DEFAULT_LOADOUT_PREFIX.into(),
             slots: vec![None; LOADOUT_SLOTS],
+            provider_order: Vec::new(),
         }
     }
 }
@@ -55,6 +63,9 @@ impl LoadoutConfig {
         }
         while self.slots.len() < LOADOUT_SLOTS {
             self.slots.push(None);
+        }
+        for slot in self.slots.iter_mut().flatten() {
+            slot.shortcut = normalize_loadout_shortcut(slot.shortcut.as_deref());
         }
         pack_slots(&mut self.slots);
         self
@@ -86,6 +97,82 @@ impl LoadoutConfig {
             *slot = None;
         }
         pack_slots(&mut self.slots);
+    }
+
+    /// Move one visual card while keeping its model and shortcut together.
+    pub fn reorder(&mut self, from: usize, to: usize) {
+        if self.slot(from).is_none() || to >= self.slots.len() || from == to {
+            return;
+        }
+        let last_filled = self
+            .slots
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count()
+            .saturating_sub(1);
+        let slot = self.slots.remove(from);
+        self.slots.insert(to.min(last_filled), slot);
+    }
+
+    /// Resolve a slot's effective activation combo.
+    pub fn combo(&self, index: usize) -> String {
+        self.resolved_combos()
+            .get(index)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Resolve all activation combos. Explicit overrides claim their physical
+    /// keys first; an inherited positional default that loses a collision is
+    /// suppressed instead of overriding the explicit binding.
+    pub fn resolved_combos(&self) -> Vec<String> {
+        self.resolved_combos_on(cfg!(target_os = "macos"))
+    }
+
+    pub fn resolved_combos_on(&self, mac: bool) -> Vec<String> {
+        let mut resolved = vec![String::new(); self.slots.len()];
+        let mut claimed = Vec::<String>::new();
+        let claim = |combo: &str, claimed: &mut Vec<String>| {
+            if combo.is_empty() {
+                return false;
+            }
+            let Some(combo) = normalize_loadout_shortcut(Some(combo)) else {
+                return false;
+            };
+            if combo.is_empty()
+                || claimed
+                    .iter()
+                    .any(|existing| same_physical_combo(mac, existing, &combo))
+            {
+                return false;
+            }
+            claimed.push(combo);
+            true
+        };
+
+        // Explicit bindings have priority regardless of their visual index.
+        for (index, slot) in self.slots.iter().enumerate() {
+            let Some(shortcut) = slot.as_ref().and_then(|slot| slot.shortcut.as_deref()) else {
+                continue;
+            };
+            if claim(shortcut, &mut claimed) {
+                resolved[index] = normalize_loadout_shortcut(Some(shortcut)).unwrap_or_default();
+            }
+        }
+        for index in 0..self.slots.len() {
+            if self
+                .slot(index)
+                .and_then(|slot| slot.shortcut.as_ref())
+                .is_some()
+            {
+                continue;
+            }
+            let combo = loadout_combo(&self.prefix, index);
+            if claim(&combo, &mut claimed) {
+                resolved[index] = combo;
+            }
+        }
+        resolved
     }
 }
 
@@ -119,6 +206,119 @@ pub fn prefix_is_valid(prefix: &str) -> bool {
 /// `{prefix}-{n}` for a 0-based slot.
 pub fn loadout_combo(prefix: &str, slot: usize) -> String {
     format!("{}-{}", prefix, slot + 1)
+}
+
+/// Normalize a persisted or recorded slot shortcut. `Some("")` is the one
+/// intentional non-binding value and stays intact.
+pub fn normalize_loadout_shortcut(shortcut: Option<&str>) -> Option<String> {
+    let Some(shortcut) = shortcut else {
+        return None;
+    };
+    let shortcut = shortcut.trim();
+    if shortcut.is_empty() {
+        return Some(String::new());
+    }
+
+    let (mut parts, minus) = if shortcut == "-" {
+        (Vec::new(), true)
+    } else if let Some(modifiers) = shortcut.strip_suffix("--") {
+        (
+            modifiers
+                .split('-')
+                .map(|part| part.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>(),
+            true,
+        )
+    } else {
+        (
+            shortcut
+                .split('-')
+                .map(|part| part.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>(),
+            false,
+        )
+    };
+    if parts.iter().any(String::is_empty) {
+        return None;
+    }
+    let mut key = if minus { "-".to_owned() } else { parts.pop()? };
+    if matches!(
+        key.as_str(),
+        "mod" | "cmd" | "ctrl" | "control" | "alt" | "option" | "shift"
+    ) {
+        return None;
+    }
+
+    let mut normalized_modifiers = Vec::new();
+    for part in parts {
+        let modifier: &'static str = match part.as_str() {
+            "cmd" => "mod",
+            "control" => "ctrl",
+            "option" => "alt",
+            "mod" => "mod",
+            "ctrl" => "ctrl",
+            "alt" => "alt",
+            "shift" => "shift",
+            _ => return None,
+        };
+        if normalized_modifiers.contains(&modifier) {
+            return None;
+        }
+        normalized_modifiers.push(modifier);
+    }
+    // macOS can report shifted digits as symbols without the shift flag.
+    // Keep one stored identity for conflict checks and generate the native
+    // spelling separately when binding.
+    if let Some((_, digit)) = SHIFTED_DIGITS.iter().find(|(symbol, _)| *symbol == key) {
+        key = (*digit).into();
+        if !normalized_modifiers.contains(&"shift") {
+            normalized_modifiers.push("shift");
+        }
+    }
+    let mut canonical = Vec::with_capacity(normalized_modifiers.len() + 1);
+    for modifier in ["mod", "ctrl", "alt", "shift"] {
+        if normalized_modifiers.contains(&modifier) {
+            canonical.push(modifier);
+        }
+    }
+    canonical.push(key.as_str());
+    let canonical = canonical.join("-");
+
+    // Validate against both platform spellings. This keeps a hand-edited
+    // shortcut from reaching KeyBinding::new, which panics on bad input.
+    if gpui::Keystroke::parse(&platform_combo_on(true, &canonical)).is_err()
+        || gpui::Keystroke::parse(&platform_combo_on(false, &canonical)).is_err()
+    {
+        return None;
+    }
+    Some(canonical)
+}
+
+const SHIFTED_DIGITS: [(&str, &str); 10] = [
+    ("!", "1"),
+    ("@", "2"),
+    ("#", "3"),
+    ("$", "4"),
+    ("%", "5"),
+    ("^", "6"),
+    ("&", "7"),
+    ("*", "8"),
+    ("(", "9"),
+    (")", "0"),
+];
+
+/// Alternate event spelling used by macOS for shifted number keys.
+pub fn loadout_symbol_alias(combo: &str) -> Option<String> {
+    let normalized = normalize_loadout_shortcut(Some(combo))?;
+    let mut parts: Vec<&str> = normalized.split('-').collect();
+    let key = parts.pop()?;
+    if !parts.contains(&"shift") {
+        return None;
+    }
+    let (symbol, _) = SHIFTED_DIGITS.iter().find(|(_, digit)| *digit == key)?;
+    parts.retain(|part| *part != "shift");
+    parts.push(symbol);
+    Some(parts.join("-"))
 }
 
 pub fn is_fixed_loadout_combo(combo: &str) -> bool {
@@ -196,6 +396,149 @@ pub fn loadout_prefix_conflict_on(
             !existing.is_empty() && platform_combo_on(mac, existing) == combo
         })
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadoutShortcutConflict {
+    OtherLoadout(usize),
+    AppShortcut(ShortcutId),
+    Reserved(&'static str),
+}
+
+/// Find a physical-key conflict for one loadout slot. Empty slots still have
+/// default bindings at runtime, so they participate in this check.
+pub fn loadout_shortcut_conflict(
+    mac: bool,
+    keymap: &KeymapConfig,
+    loadout: &LoadoutConfig,
+    index: usize,
+    combo: &str,
+) -> Option<LoadoutShortcutConflict> {
+    let combo = normalize_loadout_shortcut(Some(combo))?;
+    if combo.is_empty() {
+        return None;
+    }
+    if let Some(label) = reserved_loadout_combo(mac, &combo) {
+        return Some(LoadoutShortcutConflict::Reserved(label));
+    }
+    if let Some(owner) = keymap_shortcut_conflict(mac, keymap, &combo, None) {
+        return Some(LoadoutShortcutConflict::AppShortcut(owner));
+    }
+    loadout_shortcut_owner(mac, loadout, index, &combo).map(LoadoutShortcutConflict::OtherLoadout)
+}
+
+/// Return the keymap shortcut that owns `combo`, optionally excluding one id.
+pub fn keymap_shortcut_conflict(
+    mac: bool,
+    keymap: &KeymapConfig,
+    combo: &str,
+    excluded: Option<ShortcutId>,
+) -> Option<ShortcutId> {
+    ShortcutId::ALL.into_iter().find(|&id| {
+        Some(id) != excluded
+            && !keymap.get(id).is_empty()
+            && same_physical_combo(mac, keymap.get(id), combo)
+    })
+}
+
+/// Return the other loadout slot that owns `combo`.
+pub fn loadout_shortcut_owner(
+    mac: bool,
+    loadout: &LoadoutConfig,
+    index: usize,
+    combo: &str,
+) -> Option<usize> {
+    let resolved = loadout.resolved_combos_on(mac);
+    (0..LOADOUT_SLOTS)
+        .filter(|&other| other != index)
+        .find(|&other| {
+            let existing = resolved.get(other).map(String::as_str).unwrap_or("");
+            !existing.is_empty() && same_physical_combo(mac, existing, combo)
+        })
+}
+
+fn same_physical_combo(mac: bool, left: &str, right: &str) -> bool {
+    let left = normalize_loadout_shortcut(Some(left));
+    let right = normalize_loadout_shortcut(Some(right));
+    match (left, right) {
+        (Some(left), Some(right)) if !left.is_empty() && !right.is_empty() => {
+            match (
+                gpui::Keystroke::parse(&platform_combo_on(mac, &left)),
+                gpui::Keystroke::parse(&platform_combo_on(mac, &right)),
+            ) {
+                (Ok(left), Ok(right)) => left == right,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Fixed application and composer keys that loadout activation must not take.
+pub fn reserved_loadout_combo(mac: bool, combo: &str) -> Option<&'static str> {
+    let combo = normalize_loadout_shortcut(Some(combo))?;
+    if combo.is_empty() {
+        return None;
+    }
+    let composer = [
+        "enter",
+        "mod-enter",
+        "shift-enter",
+        "tab",
+        "backspace",
+        "delete",
+        "left",
+        "right",
+        "up",
+        "down",
+        "home",
+        "end",
+        "shift-left",
+        "shift-right",
+        "shift-up",
+        "shift-down",
+        "shift-home",
+        "shift-end",
+        "mod-left",
+        "mod-right",
+        "mod-up",
+        "mod-down",
+        "mod-shift-left",
+        "mod-shift-right",
+        "mod-shift-up",
+        "mod-shift-down",
+        "mod-backspace",
+        "ctrl-left",
+        "ctrl-right",
+        "ctrl-backspace",
+        "alt-left",
+        "alt-right",
+        "alt-backspace",
+        "mod-a",
+        "mod-c",
+        "mod-v",
+        "mod-x",
+    ];
+    if composer
+        .iter()
+        .any(|reserved| same_physical_combo(mac, reserved, &combo))
+    {
+        return Some("the composer");
+    }
+
+    let mut app = vec![
+        "mod-,", "mod-k", "mod-l", "mod-t", "mod-w", "mod-[", "mod-]",
+    ];
+    if mac {
+        app.extend(["mod-q", "mod-h", "mod-alt-h", "mod-m"]);
+    }
+    if app
+        .iter()
+        .any(|reserved| same_physical_combo(mac, reserved, &combo))
+    {
+        return Some("the app");
+    }
+    None
 }
 
 /// Why a loadout shortcut could not be applied.
@@ -361,6 +704,7 @@ mod tests {
             label: model.into(),
             reasoning: Some(ReasoningLevel::High),
             model_options: serde_json::Map::new(),
+            shortcut: None,
         }
     }
 
@@ -393,6 +737,29 @@ mod tests {
     }
 
     #[test]
+    fn symbol_aliases_and_minus_shortcuts_keep_physical_identity() {
+        assert_eq!(
+            normalize_loadout_shortcut(Some("mod--")).as_deref(),
+            Some("mod--")
+        );
+        assert_eq!(
+            normalize_loadout_shortcut(Some("mod-!")).as_deref(),
+            Some("mod-shift-1")
+        );
+        assert!(same_physical_combo(true, "mod-!", "mod-shift-1"));
+        assert!(same_physical_combo(false, "mod-ctrl-h", "mod-h"));
+        assert!(!same_physical_combo(true, "mod-ctrl-h", "mod-h"));
+        assert_eq!(
+            loadout_symbol_alias("mod-shift-1").as_deref(),
+            Some("mod-!")
+        );
+        assert_eq!(
+            loadout_symbol_alias("mod-alt-shift-5").as_deref(),
+            Some("mod-alt-%")
+        );
+    }
+
+    #[test]
     fn default_prefix_is_mod_shift() {
         assert_eq!(LoadoutConfig::default().prefix, "mod-shift");
         assert_eq!(loadout_combo("mod-shift", 0), "mod-shift-1");
@@ -407,6 +774,85 @@ mod tests {
         }
         .clamped();
         assert_eq!(config.prefix, DEFAULT_LOADOUT_PREFIX);
+    }
+
+    #[test]
+    fn legacy_slot_deserializes_without_a_shortcut() {
+        let slot: LoadoutSlot = serde_json::from_value(serde_json::json!({
+            "harness": "codex",
+            "model": "gpt-5.6",
+            "label": "GPT-5.6",
+            "reasoning": "high",
+            "modelOptions": {}
+        }))
+        .unwrap();
+        assert_eq!(slot.shortcut, None);
+        assert_eq!(LoadoutConfig::default().combo(0), "mod-shift-1");
+        let config = serde_json::from_value::<LoadoutConfig>(serde_json::json!({
+            "prefix": "mod-shift",
+            "slots": [null, null, null, null, null]
+        }))
+        .unwrap();
+        assert!(config.provider_order.is_empty());
+    }
+
+    #[test]
+    fn shortcut_normalization_canonicalizes_modifiers_and_preserves_clear() {
+        assert_eq!(
+            normalize_loadout_shortcut(Some(" Shift-CMD-X ")).as_deref(),
+            Some("mod-shift-x")
+        );
+        assert_eq!(normalize_loadout_shortcut(Some("")), Some(String::new()));
+        assert_eq!(normalize_loadout_shortcut(Some("mod-mod-x")), None);
+        assert_eq!(normalize_loadout_shortcut(Some("mod-shift")), None);
+    }
+
+    #[test]
+    fn custom_shortcut_and_clear_survive_clamping_and_reordering() {
+        let mut config = LoadoutConfig::default();
+        let mut first = slot(HarnessId::ClaudeCode, "opus");
+        first.shortcut = Some("shift-mod-1".into());
+        let mut second = slot(HarnessId::Codex, "gpt");
+        second.shortcut = Some(String::new());
+        config.slots[0] = Some(first);
+        config.slots[1] = Some(second);
+        config.provider_order = vec!["codex:default".into(), "claude-code:default".into()];
+        let mut config = config.clamped();
+        assert_eq!(config.combo(0), "mod-shift-1");
+        assert_eq!(config.combo(1), "");
+        config.reorder(0, 1);
+        assert_eq!(config.slot(0).map(|slot| slot.model.as_str()), Some("gpt"));
+        assert_eq!(config.combo(0), "");
+        assert_eq!(config.slot(1).map(|slot| slot.model.as_str()), Some("opus"));
+        assert_eq!(config.combo(1), "mod-shift-1");
+        let restored =
+            serde_json::from_value::<LoadoutConfig>(serde_json::to_value(&config).unwrap())
+                .unwrap()
+                .clamped();
+        assert_eq!(restored, config);
+    }
+
+    #[test]
+    fn explicit_shortcut_wins_over_an_inherited_default_after_reorder() {
+        let mut config = LoadoutConfig::default();
+        let mut custom = slot(HarnessId::Codex, "gpt");
+        custom.shortcut = Some("mod-shift-1".into());
+        config.slots[0] = Some(custom);
+        config.slots[1] = Some(slot(HarnessId::ClaudeCode, "opus"));
+
+        config.reorder(0, 1);
+        assert_eq!(config.combo(0), "");
+        assert_eq!(config.combo(1), "mod-shift-1");
+        assert_eq!(
+            config.resolved_combos_on(false),
+            vec![
+                String::new(),
+                "mod-shift-1".to_string(),
+                "mod-shift-3".to_string(),
+                "mod-shift-4".to_string(),
+                "mod-shift-5".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -490,6 +936,28 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_conflicts_include_other_loadouts_app_and_composer() {
+        let mut keymap = KeymapConfig::default();
+        keymap.toggle_terminal = "mod-alt-3".into();
+        let mut loadout = LoadoutConfig::default();
+        loadout.slots[1] = Some(slot(HarnessId::Codex, "gpt"));
+        assert_eq!(
+            loadout_shortcut_conflict(true, &keymap, &loadout, 0, "mod-shift-2"),
+            Some(LoadoutShortcutConflict::OtherLoadout(1))
+        );
+        assert_eq!(
+            loadout_shortcut_conflict(true, &keymap, &loadout, 0, "mod-alt-3"),
+            Some(LoadoutShortcutConflict::AppShortcut(
+                ShortcutId::ToggleTerminal
+            ))
+        );
+        assert_eq!(
+            loadout_shortcut_conflict(true, &keymap, &loadout, 0, "cmd-enter"),
+            Some(LoadoutShortcutConflict::Reserved("the composer"))
+        );
+    }
+
+    #[test]
     fn apply_gate_allows_new_chats_and_same_harness() {
         let filled = slot(HarnessId::Codex, "gpt-5.6");
         assert!(apply_loadout_gate(false, None, Some(&filled)).is_ok());
@@ -538,6 +1006,7 @@ mod tests {
         let healed = LoadoutConfig {
             prefix: "mod-shift-1".into(),
             slots: vec![Some(slot(HarnessId::Codex, "gpt"))],
+            provider_order: Vec::new(),
         }
         .clamped();
         assert_eq!(healed.prefix, DEFAULT_LOADOUT_PREFIX);

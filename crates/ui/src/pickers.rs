@@ -3671,6 +3671,9 @@ impl Pickers {
         let label: SharedString = row.model.label.clone().into();
         let harness_name = row.harness_name.clone();
         let loadout_slot = row.loadout.as_ref().map(|(index, _)| *index);
+        let loadout_combo = loadout_slot.and_then(|index| {
+            Self::loadout_row_combo(&crate::settings::current(cx).loadout, index)
+        });
         // Provider attribution (field report: several connected opencode
         // providers advertise identically-named models — "GLM-5.2" exists
         // under 64 providers — and rows were indistinguishable). The driver
@@ -3809,15 +3812,20 @@ impl Pickers {
                 this.activate_model_index(ix, cx);
             }))
             .child(body);
-        if let Some(slot) = loadout_slot {
-            let combo =
-                crate::settings::loadout_combo(crate::settings::DEFAULT_LOADOUT_PREFIX, slot);
+        if let Some(combo) = loadout_combo {
             el = el.child(popover::kbd_hint(
                 &theme,
                 &crate::settings::badge_combo(&combo),
             ));
         }
         div().pb(px(2.0)).child(el).into_any_element()
+    }
+
+    fn loadout_row_combo(loadout: &crate::settings::LoadoutConfig, index: usize) -> Option<String> {
+        loadout
+            .slot(index)
+            .and_then(|_| loadout.resolved_combos().get(index).cloned())
+            .filter(|combo| !combo.is_empty())
     }
 
     /// Model controls pinned to the bottom of the selector. Reasoning and the
@@ -4998,6 +5006,24 @@ mod tests {
     }
 
     #[test]
+    fn loadout_row_uses_custom_shortcut() {
+        let mut loadout = crate::settings::LoadoutConfig::default();
+        loadout.slots[0] = Some(crate::settings::LoadoutSlot {
+            harness: HarnessId::Codex,
+            model: "gpt-6-astra".into(),
+            label: "GPT-6-Astra".into(),
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            shortcut: Some("mod-alt-a".into()),
+        });
+
+        assert_eq!(
+            Pickers::loadout_row_combo(&loadout, 0).as_deref(),
+            Some("mod-alt-a")
+        );
+    }
+
+    #[test]
     fn tab_search_never_leaves_the_viewed_harness() {
         let descriptors = vec![
             descriptor(HarnessId::ClaudeCode, "Claude Code"),
@@ -5049,6 +5075,7 @@ mod tests {
             label: "Fable (Codex)".into(),
             reasoning: Some(ReasoningLevel::High),
             model_options: serde_json::Map::new(),
+            shortcut: None,
         });
         let rows = scoped_model_rows(
             "fable",

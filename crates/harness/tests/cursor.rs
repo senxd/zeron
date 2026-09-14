@@ -337,8 +337,10 @@ async fn reasoning_is_sent_as_cursor_effort() {
     let mut req = request("scenario:reasoning");
     req.model = Some("claude-fable-5".into());
     req.reasoning = Some(zeron_proto::ReasoningLevel::XHigh);
-    req.model_options
-        .insert("thinking".into(), serde_json::Value::String("enabled".into()));
+    req.model_options.insert(
+        "thinking".into(),
+        serde_json::Value::String("enabled".into()),
+    );
     let events = run_to_first_done(&harness(), req, controls).await;
     assert!(matches!(
         events.last(),

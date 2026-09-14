@@ -127,9 +127,7 @@ where
     E: Styled + IntoElement + 'static,
 {
     element.with_animation(id, TOAST_OUT.animation(), move |el, _| {
-        el.relative()
-            .opacity(1.0 - t)
-            .top(px(-TOAST_DISTANCE * t))
+        el.relative().opacity(1.0 - t).top(px(-TOAST_DISTANCE * t))
     })
 }
 

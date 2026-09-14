@@ -45,11 +45,11 @@ use crate::settings::loadout::{LoadoutEvent, LoadoutPage};
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    self, CHAT_PANEL_MIN, ComposerSendBehavior, DEFAULT_LOADOUT_PREFIX, JUMP_SLOTS, KeymapConfig,
-    LOADOUT_SLOTS, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN,
+    self, CHAT_PANEL_MIN, ComposerSendBehavior, JUMP_SLOTS, KeymapConfig, LOADOUT_SLOTS,
+    LoadoutConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN,
     SavePolicy, ShortcutId, SidebarOrganization, SidebarSort, TERMINAL_DEFAULT_HEIGHT, UiSettings,
-    apply_loadout_error_message, badge_combo, jump_hints_visible, loadout_combo,
-    modifier_send_hint_visible, platform_combo,
+    apply_loadout_error_message, badge_combo, jump_hints_visible, modifier_send_hint_visible,
+    platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -298,7 +298,7 @@ pub fn apply_keymap(
     cx: &mut App,
     keymap: &KeymapConfig,
     composer_send_behavior: ComposerSendBehavior,
-    _loadout_prefix: &str,
+    loadout: &LoadoutConfig,
     bind_loadout: bool,
 ) {
     fn valid_or_default(combo: &str, fallback: &str) -> String {
@@ -387,26 +387,34 @@ pub fn apply_keymap(
             None,
         ))
     }));
-    let prefix = DEFAULT_LOADOUT_PREFIX;
     if bind_loadout {
-        let mut bindings: Vec<_> = (0..LOADOUT_SLOTS)
-            .filter_map(|slot| {
-                let combo = loadout_combo(prefix, slot);
+        let mut bindings = Vec::new();
+        for slot in 0..LOADOUT_SLOTS {
+            let combo = loadout.combo(slot);
+            if combo.is_empty()
+                || crate::settings::loadout_model::loadout_shortcut_conflict(
+                    cfg!(target_os = "macos"),
+                    keymap,
+                    loadout,
+                    slot,
+                    &combo,
+                )
+                .is_some()
+            {
+                continue;
+            }
+            let mut candidates = vec![combo.clone()];
+            #[cfg(target_os = "macos")]
+            if let Some(alias) = crate::settings::loadout_model::loadout_symbol_alias(&combo) {
+                candidates.push(alias);
+            }
+            for combo in candidates {
                 let candidate = platform_combo(&combo);
                 if Keystroke::parse(&candidate).is_ok() {
-                    Some(KeyBinding::new(&candidate, ActivateLoadout(slot), None))
-                } else {
-                    None
+                    bindings.push(KeyBinding::new(&candidate, ActivateLoadout(slot), None));
                 }
-            })
-            .collect();
-        #[cfg(target_os = "macos")]
-        bindings.extend(
-            ["cmd-!", "cmd-@", "cmd-#", "cmd-$", "cmd-%"]
-                .into_iter()
-                .enumerate()
-                .map(|(slot, combo)| KeyBinding::new(combo, ActivateLoadout(slot), None)),
-        );
+            }
+        }
         cx.bind_keys(bindings);
     }
 }
@@ -1535,7 +1543,7 @@ impl Shell {
             cx,
             &settings.keymap,
             settings.composer_send_behavior,
-            &settings.loadout.prefix,
+            &settings.loadout,
             true,
         );
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
@@ -3338,6 +3346,10 @@ impl Shell {
                         |this: &mut Shell, _, event: &LoadoutEvent, cx| match event {
                             LoadoutEvent::Changed(loadout) => {
                                 this.settings.loadout = loadout.clone();
+                                if let Some(page) = &this.shortcuts_page {
+                                    let loadout = loadout.clone();
+                                    page.update(cx, |page, cx| page.set_loadout(loadout, cx));
+                                }
                                 this.rebind_keys(cx);
                                 this.schedule_save(cx);
                                 cx.notify();
@@ -3484,6 +3496,7 @@ impl Shell {
                             keymap,
                             escape_stops_active_agent,
                             composer_send_behavior,
+                            self.settings.loadout.clone(),
                             cx,
                         )
                     });
@@ -3506,7 +3519,7 @@ impl Shell {
                                 cx,
                                 &this.settings.keymap,
                                 this.settings.composer_send_behavior,
-                                &this.settings.loadout.prefix,
+                                &this.settings.loadout,
                                 !this.loadout_recording,
                             );
                             this.schedule_save(cx);
@@ -3655,7 +3668,7 @@ impl Shell {
             cx,
             &self.settings.keymap,
             self.settings.composer_send_behavior,
-            &self.settings.loadout.prefix,
+            &self.settings.loadout,
             !self.loadout_recording,
         );
     }
@@ -10959,6 +10972,98 @@ mod shortcut_focus_regressions {
         }
     }
 
+    struct LoadoutShortcutHost {
+        focus: FocusHandle,
+        activated: Vec<usize>,
+    }
+
+    impl Render for LoadoutShortcutHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().track_focus(&self.focus).on_action(
+                cx.listener(|this, event: &ActivateLoadout, _, _| this.activated.push(event.0)),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn custom_loadout_shortcut_dispatches_after_reorder_and_clear(cx: &mut TestAppContext) {
+        let mut loadout = LoadoutConfig::default();
+        for (index, model) in ["one", "two"].into_iter().enumerate() {
+            loadout.slots[index] = Some(crate::settings::LoadoutSlot {
+                harness: zeron_proto::HarnessId::Codex,
+                model: model.into(),
+                label: model.into(),
+                reasoning: None,
+                model_options: Default::default(),
+                shortcut: (index == 0).then(|| "mod-shift-h".into()),
+            });
+        }
+        cx.update(|cx| {
+            apply_keymap(
+                cx,
+                &KeymapConfig::default(),
+                ComposerSendBehavior::default(),
+                &loadout,
+                true,
+            )
+        });
+        let host = cx.add_window(|_, cx| LoadoutShortcutHost {
+            focus: cx.focus_handle(),
+            activated: Vec::new(),
+        });
+        host.update(cx, |host, window, cx| window.focus(&host.focus, cx))
+            .unwrap();
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-h"));
+        host.update(cx, |host, _, _| assert_eq!(host.activated, vec![0]))
+            .unwrap();
+        loadout.reorder(0, 1);
+        cx.update(|cx| {
+            apply_keymap(
+                cx,
+                &KeymapConfig::default(),
+                ComposerSendBehavior::default(),
+                &loadout,
+                true,
+            )
+        });
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-h"));
+        host.update(cx, |host, _, _| assert_eq!(host.activated, vec![0, 1]))
+            .unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            loadout.slots[1].as_mut().unwrap().shortcut = Some("mod-shift-1".into());
+            cx.update(|cx| {
+                apply_keymap(
+                    cx,
+                    &KeymapConfig::default(),
+                    ComposerSendBehavior::default(),
+                    &loadout,
+                    true,
+                )
+            });
+            cx.simulate_keystrokes(host.into(), "cmd-!");
+            host.update(cx, |host, _, _| {
+                assert_eq!(host.activated, vec![0, 1, 1]);
+                host.activated.pop();
+            })
+            .unwrap();
+        }
+        loadout.slots[1].as_mut().unwrap().shortcut = Some(String::new());
+        cx.update(|cx| {
+            apply_keymap(
+                cx,
+                &KeymapConfig::default(),
+                ComposerSendBehavior::default(),
+                &loadout,
+                true,
+            )
+        });
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-h"));
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-2"));
+        host.update(cx, |host, _, _| assert_eq!(host.activated, vec![0, 1]))
+            .unwrap();
+    }
+
     #[gpui::test]
     fn loadout_and_chat_number_shortcuts_dispatch_distinct_actions(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -10966,7 +11071,7 @@ mod shortcut_focus_regressions {
                 cx,
                 &KeymapConfig::default(),
                 ComposerSendBehavior::default(),
-                DEFAULT_LOADOUT_PREFIX,
+                &LoadoutConfig::default(),
                 true,
             );
         });
