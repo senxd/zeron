@@ -1,4 +1,4 @@
-//! Settings → Default models: a five-slot loadout fed by drag-and-drop from
+//! Settings → Model Loadout: a five-slot loadout fed by drag-and-drop from
 //! provider lists, with per-entry activation shortcuts.
 
 mod bindings;
