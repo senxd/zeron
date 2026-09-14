@@ -659,7 +659,6 @@ impl Pickers {
                 this.config.harness = None;
                 this.config.model = None;
                 this.config.reasoning = None;
-                this.config.model_options.clear();
                 this.reasoning_motion = None;
                 this.switch_error = None;
             }
@@ -1521,7 +1520,6 @@ impl Pickers {
             // defaults fallback; a foreign pick must not linger.
             self.config.model = None;
             self.config.reasoning = None;
-            self.config.model_options.clear();
             self.reasoning_motion = None;
         }
         self.config.harness = Some(harness);
@@ -1667,22 +1665,6 @@ impl Pickers {
         );
     }
 
-    fn reset_traits(&mut self, cx: &mut Context<Self>) {
-        let reasoning = default_reasoning(&self.trait_ladder(cx));
-        if self.state.read(cx).selected_chat.is_some() {
-            self.update_chat_config(cx, move |config| {
-                config.reasoning = reasoning;
-                config.model_options.clear();
-            });
-        } else {
-            self.config.reasoning = reasoning;
-            self.config.model_options.clear();
-            self.defaults.reasoning = reasoning;
-            self.save_defaults();
-        }
-        cx.notify();
-    }
-
     /// Apply a loadout slot to the current composer. New chats take the full
     /// config; an existing chat only accepts the same harness.
     pub fn apply_loadout_slot(
@@ -1717,7 +1699,8 @@ impl Pickers {
             self.config.harness = Some(slot.harness);
             self.config.model = Some(slot.model.clone());
             self.config.reasoning = slot.reasoning;
-            self.config.model_options = slot.model_options.clone();
+            *self.defaults.model_options_mut(slot.harness, &slot.model) =
+                slot.model_options.clone();
             self.defaults.harness = Some(slot.harness);
             self.defaults
                 .remember_model(slot.harness, slot.model.clone(), slot.label.clone());
@@ -3526,7 +3509,7 @@ impl Pickers {
                     cx.notify();
                 }))
                 .child(
-                    crate::icons::icon(crate::icons::TUNING)
+                    crate::icons::icon(crate::icons::STAR)
                         .size(px(15.0))
                         .text_color(if loadouts_view {
                             theme.text
@@ -3735,8 +3718,6 @@ impl Pickers {
             div()
                 .id("model-traits-tray")
                 .flex_none()
-                .when(self.model_expanded, |el| el.border_t_1())
-                .border_color(crate::theme::hairline(0.08))
                 // Long option stacks scroll inside the tray rather than
                 // growing the card past the viewport.
                 .max_h(px(236.0))
@@ -3967,14 +3948,12 @@ impl Pickers {
         };
         let levels = self.trait_ladder(cx);
         let current = self.effective_reasoning(cx);
-        let default_level = default_reasoning(&levels);
         let active_level = current
             .and_then(|level| levels.iter().position(|candidate| *candidate == level))
             .unwrap_or(0);
         let selections = self.explicit_options(cx);
         let speed = crate::settings::loadout_model::speed_option(&model).cloned();
         let speed_enabled = effective_speed_enabled(Some(&model), &selections).unwrap_or(false);
-        let reset_enabled = current != default_level || !selections.is_empty();
         let mut sections: Vec<AnyElement> = Vec::new();
         for (opt_ix, option) in model.options.iter().enumerate() {
             if !self.model_expanded {
@@ -4085,21 +4064,21 @@ impl Pickers {
                         theme.text_muted
                     }),
             );
-        let reset_button = div()
-            .id("model-traits-reset")
+        let settings_button = div()
+            .id("model-traits-settings")
             .size(px(28.0))
             .rounded(px(7.0))
             .flex()
             .items_center()
             .justify_center()
-            .when(reset_enabled, |el| {
-                el.cursor_pointer()
-                    .hover(|style| style.bg(crate::theme::ink(0.06)))
-                    .on_click(cx.listener(|this, _, _, cx| this.reset_traits(cx)))
-            })
-            .when(!reset_enabled, |el| el.opacity(0.3))
+            .cursor_pointer()
+            .hover(|style| style.bg(crate::theme::ink(0.06)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.dismiss(cx);
+                cx.emit(OpenLoadoutSettings);
+            }))
             .child(
-                crate::icons::icon(crate::icons::RESTART)
+                crate::icons::icon(crate::icons::SETTINGS_MINIMALISTIC)
                     .size(px(15.0))
                     .text_color(theme.text_muted),
             );
@@ -4296,7 +4275,7 @@ impl Pickers {
                                         .child(model_label),
                                 ),
                         )
-                        .child(reset_button),
+                        .child(settings_button),
                 )
                 .children(meter)
                 .into_any_element(),
