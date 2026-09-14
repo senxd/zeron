@@ -435,7 +435,8 @@ pub fn keymap_shortcut_conflict(
     excluded: Option<ShortcutId>,
 ) -> Option<ShortcutId> {
     ShortcutId::ALL.into_iter().find(|&id| {
-        Some(id) != excluded
+        id.available()
+            && Some(id) != excluded
             && !keymap.get(id).is_empty()
             && same_physical_combo(mac, keymap.get(id), combo)
     })
