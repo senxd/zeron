@@ -948,10 +948,18 @@ impl KeymapConfig {
                     default,
                 )
                 .is_some();
-                self.set(
-                    id,
-                    (!default_is_taken).then_some(default).unwrap_or("").into(),
+                let healed = if default_is_taken { "" } else { default };
+                tracing::warn!(
+                    "shortcut \"{}\" on {} conflicts with a reserved chord; reset to {}",
+                    self.get(id),
+                    id.label(),
+                    if healed.is_empty() {
+                        "disabled"
+                    } else {
+                        healed
+                    }
                 );
+                self.set(id, healed.into());
             }
         }
     }
@@ -1077,16 +1085,26 @@ pub fn platform_combo_on(mac: bool, combo: &str) -> String {
 }
 
 fn display_combo_parts(combo: &str) -> Vec<&str> {
-    if combo == "-" {
-        return vec!["-"];
-    }
-    if let Some(modifiers) = combo.strip_suffix("--") {
+    let mut parts = if combo == "-" {
+        vec!["-"]
+    } else if let Some(modifiers) = combo.strip_suffix("--") {
         let mut parts: Vec<_> = modifiers.split('-').collect();
         parts.push("-");
         parts
     } else {
         combo.split('-').collect()
+    };
+    // A recorded shifted digit is stored as the bare symbol (the OS drops
+    // the shift flag): show "mod-@" the way the user pressed it — Ctrl+Shift+2.
+    if let Some(digit) = parts
+        .last()
+        .and_then(|key| loadout_model::unshifted_digit(key))
+        .filter(|_| !parts[..parts.len() - 1].contains(&"shift"))
+    {
+        *parts.last_mut().unwrap() = digit;
+        parts.insert(parts.len() - 1, "shift");
     }
+    parts
 }
 
 /// Human-readable combo for the shortcuts table ("mod-s" → "Cmd+S"/"Ctrl+S").
@@ -2420,6 +2438,19 @@ mod tests {
         assert_eq!(badge_combo_on(true, "mod--"), "⌘-");
         assert_eq!(badge_combo_on(false, "mod--"), "Ctrl+-");
         assert_eq!(badge_combo_on(true, "mod-shift--"), "⇧⌘-");
+    }
+
+    #[test]
+    fn recorded_symbol_keys_display_the_shifted_digit() {
+        // The OS drops the shift flag for symbol keys, so recording
+        // Ctrl+Shift+2 stores "mod-@"; display folds it back to the chord the
+        // user actually pressed.
+        assert_eq!(display_combo_on(false, "mod-@"), "Ctrl+Shift+2");
+        assert_eq!(display_combo_on(true, "mod-@"), "Cmd+Shift+2");
+        assert_eq!(badge_combo_on(true, "mod-@"), "⇧⌘2");
+        // An explicit shift segment is left alone, as is a plain digit.
+        assert_eq!(display_combo_on(false, "mod-shift-@"), "Ctrl+Shift+@");
+        assert_eq!(display_combo_on(false, "mod-2"), "Ctrl+2");
     }
 
     #[test]

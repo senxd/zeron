@@ -307,7 +307,19 @@ const SHIFTED_DIGITS: [(&str, &str); 10] = [
     (")", "0"),
 ];
 
-/// Alternate event spelling used by macOS for shifted number keys.
+/// The unshifted digit a symbol key stands for on a US layout ("!" → "1").
+/// Recorders store the raw symbol spelling (the OS drops the shift flag for
+/// symbol keys); display folds it back to `shift-<digit>`.
+pub fn unshifted_digit(symbol: &str) -> Option<&'static str> {
+    SHIFTED_DIGITS
+        .iter()
+        .find(|(shifted, _)| *shifted == symbol)
+        .map(|(_, digit)| *digit)
+}
+
+/// Alternate event spelling platforms use for shifted number keys: both
+/// macOS and X11 report e.g. Ctrl+Shift+1 as `ctrl-!` with the shift flag
+/// dropped, so a `mod-shift-1` binding alone never fires there.
 pub fn loadout_symbol_alias(combo: &str) -> Option<String> {
     let normalized = normalize_loadout_shortcut(Some(combo))?;
     let mut parts: Vec<&str> = normalized.split('-').collect();

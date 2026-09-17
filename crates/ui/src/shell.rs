@@ -406,7 +406,8 @@ pub fn apply_keymap(
                 continue;
             }
             let mut candidates = vec![combo.clone()];
-            #[cfg(target_os = "macos")]
+            // X11 reports Ctrl+Shift+1 as ctrl-! (shift dropped for symbols)
+            // just like macOS, so the symbol alias must bind everywhere.
             if let Some(alias) = crate::settings::loadout_model::loadout_symbol_alias(&combo) {
                 candidates.push(alias);
             }
@@ -11967,7 +11968,6 @@ mod shortcut_focus_regressions {
         cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-h"));
         host.update(cx, |host, _, _| assert_eq!(host.activated, vec![0, 1]))
             .unwrap();
-        #[cfg(target_os = "macos")]
         {
             loadout.slots[1].as_mut().unwrap().shortcut = Some("mod-shift-1".into());
             cx.update(|cx| {
@@ -11979,7 +11979,9 @@ mod shortcut_focus_regressions {
                     true,
                 )
             });
-            cx.simulate_keystrokes(host.into(), "cmd-!");
+            // The OS drops shift for symbol keys, so the chord arrives as
+            // mod-! on every platform, not just macOS.
+            cx.simulate_keystrokes(host.into(), &platform_combo("mod-!"));
             host.update(cx, |host, _, _| {
                 assert_eq!(host.activated, vec![0, 1, 1]);
                 host.activated.pop();
@@ -12025,16 +12027,19 @@ mod shortcut_focus_regressions {
             .unwrap();
 
         cx.simulate_keystrokes(host.into(), &platform_combo("mod-1"));
-        #[cfg(target_os = "macos")]
-        for combo in ["cmd-!", "cmd-@", "cmd-#", "cmd-$", "cmd-%"] {
-            cx.simulate_keystrokes(host.into(), combo);
+        // Shifted digits arrive as the bare symbol with the shift flag
+        // dropped on macOS AND X11 — the alias binding dispatches everywhere.
+        for slot in 0..LOADOUT_SLOTS {
+            let alias = crate::settings::loadout_model::loadout_symbol_alias(
+                &crate::settings::loadout_combo(crate::settings::DEFAULT_LOADOUT_PREFIX, slot),
+            )
+            .unwrap();
+            cx.simulate_keystrokes(host.into(), &platform_combo(&alias));
         }
-        #[cfg(not(target_os = "macos"))]
-        cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-1"));
 
         host.update(cx, |host, _, _| {
             assert_eq!(host.jumps, 1);
-            assert_eq!(host.loadouts, if cfg!(target_os = "macos") { 5 } else { 1 });
+            assert_eq!(host.loadouts, 5);
         })
         .unwrap();
     }

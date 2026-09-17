@@ -32,7 +32,7 @@ mod normalize;
 mod subagent;
 mod subagent_devin;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -526,6 +526,12 @@ pub struct AcpHarness {
     /// Model discovery cache: only a successful, non-empty probe is cached,
     /// so a mis-authed agent retries on the next picker open.
     models_cache: tokio::sync::OnceCell<Vec<Model>>,
+    /// Pi's probe runs in the target cwd because project-local
+    /// `enabledModels` can differ per workspace — one shared OnceCell can't
+    /// answer for all of them. Only the raw advertised list is cached;
+    /// patterns are re-read and re-applied per call so edits take effect
+    /// immediately. Same rule as `models_cache`: only non-empty successes.
+    pi_models_cache: tokio::sync::Mutex<HashMap<PathBuf, Vec<Model>>>,
     /// Coalesce concurrent picker/title probes. Starting several OpenCode
     /// processes at once makes cold plugin loading slower and wastes memory.
     models_probe: tokio::sync::Mutex<()>,
@@ -547,6 +553,7 @@ impl AcpHarness {
             model_discovery_timeout: DEFAULT_MODEL_DISCOVERY_TIMEOUT,
             commands: tokio::sync::OnceCell::new(),
             models_cache: tokio::sync::OnceCell::new(),
+            pi_models_cache: tokio::sync::Mutex::new(HashMap::new()),
             models_probe: tokio::sync::Mutex::new(()),
             devin_models: devin_models::Catalog::default(),
         }
@@ -1395,13 +1402,29 @@ impl Harness for AcpHarness {
                 .unwrap_or_else(|| PathBuf::from("/"));
             let patterns = load_pi_model_patterns(&cwd).filter(|patterns| !patterns.is_empty());
             let _probe = self.models_probe.lock().await;
+            if let Some(models) = self.pi_models_cache.lock().await.get(&cwd).cloned() {
+                return Ok(match patterns {
+                    Some(patterns) => filter_pi_models(models, &patterns),
+                    None => models,
+                });
+            }
             return match self.discover_models(Some(&cwd)).await {
-                Ok(models) => match patterns {
-                    Some(patterns) => Ok(filter_pi_models(models, &patterns)),
-                    _ if models.is_empty() => Ok((self.spec.models)()),
-                    _ => Ok(models),
-                },
-                Err(_) if patterns.is_some() => Ok(Vec::new()),
+                Ok(models) => {
+                    if !models.is_empty() {
+                        self.pi_models_cache
+                            .lock()
+                            .await
+                            .insert(cwd.clone(), models.clone());
+                    }
+                    match patterns {
+                        Some(patterns) => Ok(filter_pi_models(models, &patterns)),
+                        _ if models.is_empty() => Ok((self.spec.models)()),
+                        _ => Ok(models),
+                    }
+                }
+                // With enabledModels set an empty fallback would paint an
+                // empty column; surface the probe failure instead.
+                Err(error) if patterns.is_some() => Err(error),
                 Err(_) => Ok((self.spec.models)()),
             };
         }
