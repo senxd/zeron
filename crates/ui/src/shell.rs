@@ -653,9 +653,15 @@ fn sidebar_key_order_changed(old: &[(String, f32)], new: &[(String, f32)]) -> bo
 /// and the Working glyph lives in the status corner, so neither adds a third
 /// line. Compact rows omit the metadata line and its preceding gap entirely;
 /// branch / pull-request rows add the exact height of their tallest child.
-/// Keeping this calculation beside the renderer's metrics prevents disclosure
-/// clips when view options alter the row structure.
-pub(super) fn chat_row_height(shows_branch: bool, shows_pull_request: bool) -> f32 {
+/// Hiding the "project @ device" line drops its line and gap too — the corner
+/// joins the title line instead. Keeping this calculation beside the
+/// renderer's metrics prevents disclosure clips when view options alter the
+/// row structure.
+pub(super) fn chat_row_height(
+    shows_location: bool,
+    shows_branch: bool,
+    shows_pull_request: bool,
+) -> f32 {
     let mut metadata_height: f32 = 0.0;
     if shows_branch {
         metadata_height = metadata_height.max(14.0);
@@ -663,11 +669,16 @@ pub(super) fn chat_row_height(shows_branch: bool, shows_pull_request: bool) -> f
     if shows_pull_request {
         metadata_height = metadata_height.max(16.0);
     }
-    if metadata_height == 0.0 {
-        45.0
-    } else {
-        47.0 + metadata_height
+    // 12px vertical padding + the 17px title line; the "project @ device" line
+    // and the optional metadata line each add their content plus the 2px gap.
+    let mut height = 29.0;
+    if shows_location {
+        height += 16.0;
     }
+    if metadata_height > 0.0 {
+        height += 2.0 + metadata_height;
+    }
+    height
 }
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
@@ -4782,7 +4793,7 @@ impl Shell {
         id: String,
         title: SharedString,
         time_ago: SharedString,
-        space_name: SharedString,
+        space_name: Option<SharedString>,
         branch: Option<SharedString>,
         change_request: Option<zeron_proto::ChangeRequestSummary>,
         harness: Option<zeron_proto::HarnessId>,
@@ -5004,6 +5015,39 @@ impl Shell {
         // dimmed the active row under the pointer (user report).
         let hover_bg = if selected { selected_wash } else { hover };
         let rest_text = if selected { text } else { text.opacity(0.8) };
+        // Line 1 ("project @ device" + corner) is optional — while Location is
+        // hidden the corner joins the title line so the row keeps its status
+        // affordance at its shrunken height.
+        let (location_line, title_corner): (Option<AnyElement>, Option<AnyElement>) =
+            match space_name {
+                Some(space_name) => (
+                    Some(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(Theme::SPACE_SM))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(11.0))
+                                    .line_height(px(14.0))
+                                    .text_color(subline)
+                                    .child(space_name),
+                            )
+                            .child(div().text_color(subline).child(corner))
+                            .into_any_element(),
+                    ),
+                    None,
+                ),
+                None => (
+                    None,
+                    Some(div().text_color(subline).child(corner).into_any_element()),
+                ),
+            };
         div()
             .id(SharedString::from(format!("chat-{id}")))
             .flex()
@@ -5051,25 +5095,7 @@ impl Shell {
                 }),
             )
             // Line 1: "project @ device", status word / time-ago right.
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(Theme::SPACE_SM))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .line_height(px(14.0))
-                            .text_color(subline)
-                            .child(space_name),
-                    )
-                    .child(div().text_color(subline).child(corner)),
-            )
+            .when_some(location_line, |row, line| row.child(line))
             // Line 2: harness identity belongs directly with the title,
             // instead of floating as unrelated metadata below it.
             .child(
@@ -5098,7 +5124,8 @@ impl Shell {
                             .text_size(crate::typography::ui_rems(13.0))
                             .line_height(px(17.0))
                             .child(title),
-                    ),
+                    )
+                    .when_some(title_corner, |el, corner| el.child(corner)),
             )
             // Line 3 is structural, not reserved whitespace: compact states
             // omit it completely when both Branch and Pull request are hidden.
@@ -9798,10 +9825,14 @@ mod tests {
 
     #[test]
     fn sidebar_chat_height_tracks_visible_metadata() {
-        assert_eq!(chat_row_height(false, false), 45.0);
-        assert_eq!(chat_row_height(true, false), 61.0);
-        assert_eq!(chat_row_height(false, true), 63.0);
-        assert_eq!(chat_row_height(true, true), 63.0);
+        assert_eq!(chat_row_height(true, false, false), 45.0);
+        assert_eq!(chat_row_height(true, true, false), 61.0);
+        assert_eq!(chat_row_height(true, false, true), 63.0);
+        assert_eq!(chat_row_height(true, true, true), 63.0);
+        assert_eq!(chat_row_height(false, false, false), 29.0);
+        assert_eq!(chat_row_height(false, true, false), 45.0);
+        assert_eq!(chat_row_height(false, false, true), 47.0);
+        assert_eq!(chat_row_height(false, true, true), 47.0);
     }
 
     #[test]

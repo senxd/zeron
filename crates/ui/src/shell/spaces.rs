@@ -16,7 +16,7 @@ use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing
 struct ActiveChatRow {
     status: ChatIndicator,
     chat: zeron_proto::Chat,
-    folder: String,
+    folder: Option<String>,
     branch: Option<String>,
     change_request: Option<zeron_proto::ChangeRequestSummary>,
     group: Option<(String, String)>,
@@ -85,6 +85,7 @@ enum SidebarViewRow {
     InOneList,
     LastUpdated,
     Created,
+    ShowLocation,
     ShowBranch,
     ShowPullRequest,
     ShowHarness,
@@ -101,11 +102,12 @@ impl SidebarViewRow {
     }
 }
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 7] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 8] = [
     SidebarViewRow::ByDevice,
     SidebarViewRow::InOneList,
     SidebarViewRow::LastUpdated,
     SidebarViewRow::Created,
+    SidebarViewRow::ShowLocation,
     SidebarViewRow::ShowBranch,
     SidebarViewRow::ShowPullRequest,
     SidebarViewRow::ShowHarness,
@@ -553,6 +555,9 @@ impl Shell {
             }
             SidebarViewRow::LastUpdated => self.settings.sidebar_sort = SidebarSort::LastUpdated,
             SidebarViewRow::Created => self.settings.sidebar_sort = SidebarSort::Created,
+            SidebarViewRow::ShowLocation => {
+                self.settings.sidebar_show_location = !self.settings.sidebar_show_location
+            }
             SidebarViewRow::ShowBranch => {
                 self.settings.sidebar_show_branch = !self.settings.sidebar_show_branch
             }
@@ -613,6 +618,7 @@ impl Shell {
         let focus = menu_state.focus.clone();
         let organization = self.settings.sidebar_organization;
         let sort = self.settings.sidebar_sort;
+        let show_location = self.settings.sidebar_show_location;
         let show_harness = self.settings.sidebar_show_harness;
         let show_branch = self.settings.sidebar_show_branch;
         let show_pr = self.settings.sidebar_show_pull_request;
@@ -622,6 +628,7 @@ impl Shell {
             "In one list",
             "Last updated",
             "Created",
+            "Location",
             "Branch",
             "Pull request",
             "Harness",
@@ -631,6 +638,7 @@ impl Shell {
             icons::LIST,
             icons::CLOCK_CIRCLE,
             icons::CALENDAR,
+            icons::FOLDER,
             icons::GIT_BRANCH,
             icons::PULL_REQUEST,
             icons::BOT,
@@ -640,6 +648,7 @@ impl Shell {
             organization == SidebarOrganization::InOneList,
             sort == SidebarSort::LastUpdated,
             sort == SidebarSort::Created,
+            show_location,
             show_branch,
             show_pr,
             show_harness,
@@ -1147,7 +1156,7 @@ impl Shell {
                     ActiveChatRow {
                         status,
                         chat: chat.clone(),
-                        folder,
+                        folder: Some(folder),
                         branch,
                         change_request,
                         group,
@@ -1155,6 +1164,11 @@ impl Shell {
                 })
                 .collect()
         };
+        if !self.settings.sidebar_show_location {
+            for row in &mut rows {
+                row.folder = None;
+            }
+        }
         if !self.settings.sidebar_show_branch {
             for row in &mut rows {
                 row.branch = None;
@@ -1208,7 +1222,11 @@ impl Shell {
                     .sidebar_show_harness
                     .then(|| chat.config.as_ref().map(|c| c.harness))
                     .flatten();
-                let height = super::chat_row_height(branch.is_some(), change_request.is_some());
+                let height = super::chat_row_height(
+                    folder.is_some(),
+                    branch.is_some(),
+                    change_request.is_some(),
+                );
                 // Only rows a jump slot can reach wear a chip; row 10 onward
                 // keeps its time-ago.
                 let jump_label: Option<SharedString> = if jump_hints {
@@ -1225,7 +1243,7 @@ impl Shell {
                     )
                     .into(),
                     time_ago,
-                    folder.into(),
+                    folder.map(SharedString::from),
                     branch.map(SharedString::from),
                     change_request,
                     harness,
