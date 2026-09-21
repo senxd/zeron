@@ -1,5 +1,4 @@
 use std::{
-    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::Arc,
@@ -8,13 +7,13 @@ use std::{
 
 use gpui::{
     AnyElement, App, Context, Entity, Focusable as _, HighlightStyle, ListAlignment,
-    ListSizingBehavior, ListState, Point, Render, ScrollHandle, SharedString, Subscription, Window,
-    div, font, list, prelude::*, px,
+    ListSizingBehavior, ListState, Render, ScrollHandle, SharedString, Subscription, Window, div,
+    font, list, prelude::*, px,
 };
 use gpui_base::input::{RopeExt as _, TextDecoration, TextDecorationCollection};
 use zeron_proto::{
-    ReadWorkspaceFileRequest, WorkspaceFileSearchMatch, WorkspaceReadOnlyReason,
-    WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
+    ReadWorkspaceFileRequest, WorkspaceReadOnlyReason, WriteWorkspaceFileOutcome,
+    WriteWorkspaceFileRequest,
 };
 
 use super::{
@@ -32,8 +31,16 @@ use crate::{
 };
 
 const PREVIEW_LINE_HEIGHT: f32 = 20.0;
-const WIDE_BREAKPOINT: f32 = 680.0;
-const TREE_SPLIT_DEFAULT: f32 = 286.0;
+/// One shared `code_font_size` setting drives two surfaces in this file that
+/// never agreed on a size: the editable editor and the plain preview. Each
+/// scales off its own baseline so the default setting reproduces the size that
+/// surface always had, and a user-chosen size moves both while keeping their
+/// proportions.
+const EDITOR_TEXT_SIZE: f32 = 13.0;
+const PREVIEW_TEXT_SIZE: f32 = 11.5;
+const EDITOR_TEXT_SIZE_RATIO: f32 = EDITOR_TEXT_SIZE / crate::typography::CODE_FONT_SIZE_DEFAULT;
+const PREVIEW_TEXT_SIZE_RATIO: f32 = PREVIEW_TEXT_SIZE / crate::typography::CODE_FONT_SIZE_DEFAULT;
+const PREVIEW_LINE_HEIGHT_RATIO: f32 = PREVIEW_LINE_HEIGHT / PREVIEW_TEXT_SIZE;
 const EDITOR_COMMENT_CARD_WIDTH: f32 = 320.0;
 const EDITOR_COMMENT_CARD_MARGIN: f32 = 8.0;
 const EDITOR_COMMENT_CARD_MIN_ANCHORED_WIDTH: f32 = 220.0;
@@ -61,6 +68,7 @@ struct EditorCommentAnchor {
 }
 
 struct EditorCommentDraft {
+    editing_id: Option<String>,
     key: String,
     path: String,
     line: u32,
@@ -87,48 +95,8 @@ enum ReloadDecision {
     AwaitDiscardConfirmation,
 }
 
-/// Openness is independent of the dragged width, so resizing remains direct.
-#[derive(Default)]
-struct TreeSidebarMotion {
-    target: Option<bool>,
-    from: f32,
-    started: Option<Instant>,
-}
-
-impl TreeSidebarMotion {
-    fn sample(&mut self, visible: bool, now: Instant, reduced: bool) -> (f32, bool) {
-        let end = f32::from(visible);
-        let duration = crate::motion::RESIZE
-            .total()
-            .mul_f32(crate::motion::speed_scale());
-        // Layout and file activation changes are immediate. Only the toggle
-        // action starts a transition through animate_to.
-        if reduced || self.target != Some(visible) {
-            self.target = Some(visible);
-            self.started = None;
-            return (end, false);
-        }
-        if let Some(started) = self.started {
-            let raw = now.saturating_duration_since(started).as_secs_f32() / duration.as_secs_f32();
-            if raw < 1.0 {
-                return (
-                    crate::motion::lerp(self.from, end, crate::motion::RESIZE.progress(raw)),
-                    true,
-                );
-            }
-            self.started = None;
-        }
-        (end, false)
-    }
-
-    fn animate_to(&mut self, previous: bool, visible: bool, now: Instant) {
-        self.from = self.sample(previous, now, false).0;
-        self.target = Some(visible);
-        self.started = Some(now);
-    }
-}
-
 pub(super) struct FilePreviewState {
+    images_visible: bool,
     documents: HashMap<String, FileDocument>,
     document_recency: VecDeque<String>,
     active: Option<String>,
@@ -136,20 +104,16 @@ pub(super) struct FilePreviewState {
     syntax_cache: SyntaxHighlightCache,
     list: ListState,
     horizontal_scroll: ScrollHandle,
-    surface_width: Rc<Cell<f32>>,
     word_wrap: bool,
     editor_font_size: f32,
     autosave_enabled: bool,
     autosave_delay_ms: u64,
     reload_confirmation: Option<String>,
     close_requested: bool,
-    tree_sidebar_visible: bool,
-    tree_sidebar_dismissed: bool,
-    tree_width: f32,
-    tree_motion: TreeSidebarMotion,
     comment_anchors: HashMap<String, HashMap<String, EditorCommentAnchor>>,
     comment_draft: Option<EditorCommentDraft>,
     active_comment: Option<String>,
+    typography_generation: u32,
 }
 
 impl FilePreviewState {
@@ -160,6 +124,7 @@ impl FilePreviewState {
         editor_font_size: f32,
     ) -> Self {
         Self {
+            images_visible: true,
             documents: HashMap::new(),
             document_recency: VecDeque::new(),
             active: None,
@@ -167,20 +132,16 @@ impl FilePreviewState {
             syntax_cache: SyntaxHighlightCache::default(),
             list: ListState::new(0, ListAlignment::Top, px(520.0)),
             horizontal_scroll: ScrollHandle::new(),
-            surface_width: Rc::new(Cell::new(520.0)),
             word_wrap,
             editor_font_size,
             autosave_enabled,
             autosave_delay_ms,
             reload_confirmation: None,
             close_requested: false,
-            tree_sidebar_visible: false,
-            tree_sidebar_dismissed: false,
-            tree_width: TREE_SPLIT_DEFAULT,
-            tree_motion: TreeSidebarMotion::default(),
             comment_anchors: HashMap::new(),
             comment_draft: None,
             active_comment: None,
+            typography_generation: 0,
         }
     }
 
@@ -192,8 +153,6 @@ impl FilePreviewState {
         self.list.reset(0);
         self.reload_confirmation = None;
         self.close_requested = false;
-        self.tree_sidebar_visible = false;
-        self.tree_motion = TreeSidebarMotion::default();
         self.comment_anchors.clear();
         self.comment_draft = None;
         self.active_comment = None;
@@ -305,37 +264,26 @@ impl FilePreviewState {
         evicted
     }
 
-    pub(super) fn is_wide(&self) -> bool {
-        self.surface_width.get() >= WIDE_BREAKPOINT
-    }
-
-    pub(super) fn width_cell(&self) -> Rc<Cell<f32>> {
-        self.surface_width.clone()
-    }
-
-    pub(super) fn tree_sidebar_visible(&self) -> bool {
-        self.tree_sidebar_visible || (self.is_wide() && !self.tree_sidebar_dismissed)
-    }
-
-    fn show_tree_sidebar(&mut self) {
-        self.tree_sidebar_visible = true;
-        self.tree_sidebar_dismissed = false;
-    }
-
-    fn toggle_tree_sidebar(&mut self) {
-        let previous = self.tree_sidebar_visible();
-        if previous {
-            self.tree_sidebar_visible = false;
-            self.tree_sidebar_dismissed = true;
-        } else {
-            self.show_tree_sidebar();
-        }
-        self.tree_motion
-            .animate_to(previous, self.tree_sidebar_visible(), Instant::now());
-    }
-
     fn word_wrap(&self) -> bool {
         self.word_wrap
+    }
+
+    /// Row height for plain (non-editable) preview lines. The list's
+    /// uniform-height hint and the painted rows must both read it from here: a
+    /// fixed 20 px row clips glyphs at larger code sizes, and a hint that
+    /// disagrees with the painted row desyncs the virtualized measurements.
+    fn line_height(&self) -> gpui::Pixels {
+        px((self.preview_text_size() * PREVIEW_LINE_HEIGHT_RATIO).max(PREVIEW_LINE_HEIGHT))
+    }
+
+    /// Text size of the editable editor.
+    fn editor_text_size(&self) -> f32 {
+        crate::typography::clamp_font_size(self.editor_font_size * EDITOR_TEXT_SIZE_RATIO)
+    }
+
+    /// Text size of the plain (non-editable) preview rows.
+    fn preview_text_size(&self) -> f32 {
+        crate::typography::clamp_font_size(self.editor_font_size * PREVIEW_TEXT_SIZE_RATIO)
     }
 
     pub(super) fn set_editor_font_size(&mut self, editor_font_size: f32) {
@@ -364,22 +312,6 @@ impl FilePreviewState {
             }
         }
         pending
-    }
-
-    pub(super) fn tree_sidebar_frame(&mut self, window: &mut Window, cx: &App) -> f32 {
-        let (openness, active) = self.tree_motion.sample(
-            self.tree_sidebar_visible(),
-            Instant::now(),
-            crate::motion::reduced_motion(cx),
-        );
-        if active {
-            window.request_animation_frame();
-        }
-        openness
-    }
-
-    pub(super) fn tree_width(&self) -> f32 {
-        self.tree_width
     }
 
     pub(super) fn has_unsaved_changes(&self) -> bool {
@@ -418,10 +350,6 @@ impl FilePreviewState {
 
     fn autosave_paused_for_reload(&self, path: &str) -> bool {
         self.reload_confirmation.as_deref() == Some(path)
-    }
-
-    pub(super) fn narrow_tree_width(&self) -> f32 {
-        (self.surface_width.get() * 0.44).clamp(152.0, self.tree_width)
     }
 }
 
@@ -566,16 +494,6 @@ fn path_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
     path == ancestor || path.starts_with(&format!("{ancestor}/"))
 }
 
-pub(super) struct PreviewSplitResize;
-
-struct PreviewDragGhost;
-
-impl Render for PreviewDragGhost {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size(px(1.0))
-    }
-}
-
 pub(super) struct FileEditorTooltip {
     pub(super) text: SharedString,
 }
@@ -583,23 +501,52 @@ pub(super) struct FileEditorTooltip {
 impl Render for FileEditorTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
-        div()
+        let card = div()
             .max_w(px(360.0))
             .px(px(9.0))
             .py(px(6.0))
             .rounded(px(6.0))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.surface_overlay)
+            .bg(crate::popover::surface_bg(theme))
             .font_family(theme.font_sans.clone())
             .text_size(px(10.5))
             .text_color(theme.text_muted)
-            .child(self.text.clone())
+            .child(self.text.clone());
+        crate::frost::frosted(6.0, crate::frost::MENU_BLUR, card)
     }
 }
 
 impl FilesSurface {
+    #[cfg(test)]
+    pub(crate) fn test_images_visible(&self) -> bool {
+        self.preview.images_visible
+    }
+
+    pub(crate) fn suspend_images(&mut self, cx: &mut Context<Self>) {
+        if !self.preview.images_visible {
+            return;
+        }
+        self.preview.images_visible = false;
+        for document in self.preview.documents.values() {
+            if let Some(view) = &document.image {
+                view.update(cx, |view, cx| view.suspend(cx));
+            }
+        }
+    }
+
     pub(crate) fn focus_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .preview
+            .active
+            .as_ref()
+            .and_then(|path| self.preview.documents.get(path))
+            .and_then(|d| d.image.clone())
+        {
+            let focus = view.read(cx).focus.clone();
+            window.defer(cx, move |window, cx| focus.focus(window, cx));
+            return;
+        }
         if let Some(view) = self
             .preview
             .active
@@ -624,20 +571,6 @@ impl FilesSurface {
         let focus = editor.focus_handle(cx);
         // Tab activation remounts this surface after the click handler returns.
         window.defer(cx, move |window, cx| focus.focus(window, cx));
-    }
-
-    pub(super) fn show_tree_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.preview.show_tree_sidebar();
-        cx.notify();
-    }
-
-    fn toggle_tree_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.preview.toggle_tree_sidebar();
-        if !self.preview.tree_sidebar_visible() {
-            // A hidden search input must not keep receiving editor keystrokes.
-            self.focus_editor(window, cx);
-        }
-        cx.notify();
     }
 
     fn toggle_word_wrap(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -802,6 +735,14 @@ impl FilesSurface {
             }
             self.sync_editor_comment_anchors(path, editor, cx);
         }
+        if let Some(draft) = self.preview.comment_draft.as_mut()
+            && draft.path == path
+            && let Some((_, line)) = updates
+                .iter()
+                .find(|(id, _)| draft.editing_id.as_ref() == Some(id))
+        {
+            draft.line = *line;
+        }
         if !updates.is_empty() {
             let key = self.chat_id.clone();
             self.state.update(cx, |state, cx| {
@@ -841,6 +782,7 @@ impl FilesSurface {
         });
         let focus = input.read(cx).focus_handle(cx);
         self.preview.comment_draft = Some(EditorCommentDraft {
+            editing_id: None,
             key: self.chat_id.clone(),
             path,
             line,
@@ -852,8 +794,35 @@ impl FilesSurface {
         cx.notify();
     }
 
+    pub(super) fn edit_editor_comment(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(comment) = self
+            .state
+            .read(cx)
+            .review_comments(&self.chat_id)
+            .iter()
+            .find(|comment| comment.id == id && comment.is_file())
+            .cloned()
+        else {
+            return;
+        };
+        self.open_editor_comment_draft(comment.path, comment.line, window, cx);
+        let draft = self.preview.comment_draft.as_mut().unwrap();
+        draft.editing_id = Some(comment.id);
+        draft
+            .input
+            .update(cx, |input, cx| input.set_text(comment.body, cx));
+        cx.notify();
+    }
+
     pub(super) fn cancel_editor_comment(&mut self, cx: &mut Context<Self>) {
-        self.preview.comment_draft = None;
+        if let Some(draft) = self.preview.comment_draft.take() {
+            self.preview.active_comment = draft.editing_id;
+        }
         self.trim_document_cache(cx);
         cx.notify();
     }
@@ -864,6 +833,17 @@ impl FilesSurface {
         };
         let body = draft.input.read(cx).text().trim().to_string();
         if body.is_empty() {
+            self.preview.active_comment = draft.editing_id;
+            cx.notify();
+            return;
+        }
+        if let Some(id) = draft.editing_id {
+            self.state.update(cx, |state, cx| {
+                state.update_review_comment_body(&draft.key, &id, body);
+                cx.notify();
+            });
+            self.preview.active_comment = Some(id);
+            self.trim_document_cache(cx);
             cx.notify();
             return;
         }
@@ -970,6 +950,7 @@ impl FilesSurface {
             .as_ref()
             .is_some_and(|active| active != &path)
         {
+            self.suspend_images(cx);
             if let Some(view) = self
                 .preview
                 .active
@@ -991,7 +972,6 @@ impl FilesSurface {
         }
         self.preview.active = Some(path.clone());
         self.preview.touch_document(&path);
-        self.preview.tree_sidebar_visible = false;
         if !self.preview.documents.contains_key(&path) {
             let Some(context) = self.request_context.as_ref() else {
                 return;
@@ -1001,6 +981,12 @@ impl FilesSurface {
                 FileDocument::loading(document_key(context, path.clone())),
             );
             self.read_file(path, cx);
+        } else if self.preview.documents.get(&path).is_some_and(|d| {
+            d.image.is_none()
+                && (super::image_preview::is_image(&path)
+                    || (d.file.is_none() && d.read_task.is_none()))
+        }) {
+            self.read_file(path, cx);
         } else {
             self.sync_preview_list();
         }
@@ -1009,6 +995,10 @@ impl FilesSurface {
     }
 
     fn read_file(&mut self, path: String, cx: &mut Context<Self>) {
+        if super::image_preview::is_image(&path) {
+            self.read_image_file(path, cx);
+            return;
+        }
         let Some(context) = self.request_context.clone() else {
             return;
         };
@@ -1080,6 +1070,42 @@ impl FilesSurface {
             document.read_task = Some(task);
         }
         self.sync_preview_list();
+        cx.notify();
+    }
+
+    fn read_image_file(&mut self, path: String, cx: &mut Context<Self>) {
+        // A rename can give an edited text buffer an image extension. Never
+        // discard that buffer (or an in-flight save) to create a preview.
+        if self.preview.documents.get(&path).is_some_and(|d| {
+            d.is_dirty() || d.pending_save.is_some() || matches!(d.phase, DocumentPhase::Saving)
+        }) {
+            return;
+        }
+        let Some(context) = self.request_context.clone() else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            if let Some(document) = self.preview.documents.get_mut(&path) {
+                document.set_error("Workspace service is still starting.");
+            }
+            return;
+        };
+        let client = WorkspaceFilesClient::new(engine, context.clone());
+        let view =
+            cx.new(|cx| super::image_preview::ImagePreview::new(path.clone(), context, client, cx));
+        if !self.preview.images_visible {
+            view.update(cx, |view, cx| view.suspend(cx));
+        }
+        if let Some(document) = self.preview.documents.get_mut(&path) {
+            document.begin_load();
+            document.image = Some(view);
+            document.file = None;
+            document.editor = None;
+            document.editor_events = None;
+            document.editor_observer = None;
+            document.lines = Arc::new(Vec::new());
+            document.phase = DocumentPhase::ReadOnly(WorkspaceReadOnlyReason::Binary);
+        }
         cx.notify();
     }
 
@@ -1455,6 +1481,7 @@ impl FilesSurface {
     pub fn prepare_close(&mut self, cx: &mut Context<Self>) -> FilesCloseDisposition {
         let dirty_paths = self.preview.dirty_paths();
         if dirty_paths.is_empty() {
+            self.suspend_images(cx);
             return FilesCloseDisposition::Allow;
         }
         self.preview.close_requested = true;
@@ -1531,6 +1558,25 @@ impl FilesSurface {
     }
 
     pub(super) fn reconcile_document(&mut self, path: String, cx: &mut Context<Self>) {
+        if super::image_preview::is_image(&path)
+            && !self.preview.documents.get(&path).is_some_and(|d| {
+                d.is_dirty() || d.pending_save.is_some() || matches!(d.phase, DocumentPhase::Saving)
+            })
+        {
+            if self.preview.documents.contains_key(&path) {
+                if self.preview.images_visible && self.preview.active.as_deref() == Some(&path) {
+                    self.read_image_file(path, cx);
+                } else if let Some(view) = self
+                    .preview
+                    .documents
+                    .get(&path)
+                    .and_then(|d| d.image.clone())
+                {
+                    view.update(cx, |view, cx| view.suspend(cx));
+                }
+            }
+            return;
+        }
         let Some(context) = self.request_context.clone() else {
             return;
         };
@@ -1651,6 +1697,9 @@ impl FilesSurface {
         for (document_path, document) in &mut self.preview.documents {
             if path_is_same_or_descendant(document_path, path) {
                 document.mark_deleted();
+                if let Some(view) = &document.image {
+                    view.update(cx, |view, cx| view.deleted(cx));
+                }
                 changed = true;
             }
         }
@@ -1674,10 +1723,21 @@ impl FilesSurface {
                     .map(|renamed| (path.clone(), renamed))
             })
             .collect::<Vec<_>>();
+        let image_renames: HashSet<_> = renames
+            .iter()
+            .filter(|(old, new)| {
+                super::image_preview::is_image(old) || super::image_preview::is_image(new)
+            })
+            .map(|(_, new)| new.clone())
+            .collect();
         for (old_document_path, new_document_path) in &renames {
             let Some(mut document) = self.preview.documents.remove(old_document_path) else {
                 continue;
             };
+            if let Some(view) = document.image.take() {
+                view.update(cx, |view, cx| view.suspend(cx));
+            }
+            document.generation = document.generation.wrapping_add(1);
             let needs_review =
                 document.is_dirty() || matches!(document.phase, DocumentPhase::Saving);
             document.read_task = None;
@@ -1733,6 +1793,18 @@ impl FilesSurface {
                 .documents
                 .insert(new_document_path.clone(), document);
         }
+        for (_, path) in &renames {
+            if image_renames.contains(path)
+                && self.preview.active.as_deref() == Some(path)
+                && !self
+                    .preview
+                    .documents
+                    .get(path)
+                    .is_some_and(FileDocument::is_dirty)
+            {
+                self.read_file(path.clone(), cx);
+            }
+        }
         if !renames.is_empty() {
             cx.notify();
         }
@@ -1782,7 +1854,7 @@ impl FilesSurface {
             .unwrap_or(0);
         self.preview
             .list
-            .reset_with_uniform_height(count, px(PREVIEW_LINE_HEIGHT));
+            .reset_with_uniform_height(count, self.preview.line_height());
     }
 
     fn request_reload_active_document(&mut self, cx: &mut Context<Self>) {
@@ -1847,6 +1919,14 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
+        let typography_generation = crate::typography::generation(cx);
+        if self.preview.typography_generation != typography_generation {
+            self.preview.typography_generation = typography_generation;
+            // Row heights are cached per item, including virtualized rows off
+            // screen, so a code-size change leaves stale geometry behind.
+            // `remeasure` re-derives them while holding the scroll position.
+            self.preview.list.remeasure();
+        }
         let Some(active) = self.preview.active.clone() else {
             return gpui::Empty.into_any_element();
         };
@@ -2020,35 +2100,6 @@ impl FilesSurface {
             .into_any_element()
     }
 
-    pub(super) fn render_tree_toggle(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        toolbar(theme)
-            .w(px(
-                crate::surface_chrome::CONTROL_SIZE + crate::surface_chrome::EDGE_INSET
-            ))
-            .pl_0()
-            .child(
-                toolbar_button(
-                    "files-toggle-tree-sidebar",
-                    if self.preview.tree_sidebar_visible() {
-                        "Hide files sidebar"
-                    } else {
-                        "Show files sidebar"
-                    },
-                )
-                .on_click(cx.listener(|this, _, window, cx| this.toggle_tree_sidebar(window, cx)))
-                .child(
-                    icon(icons::SIDEBAR_MINIMALISTIC)
-                        .size(px(crate::surface_chrome::ICON_SIZE))
-                        .text_color(theme.text_muted),
-                ),
-            )
-            .into_any_element()
-    }
-
     pub(super) fn render_editor_header(
         &mut self,
         theme: &Theme,
@@ -2157,6 +2208,14 @@ impl FilesSurface {
             .tooltip_show_delay(Duration::from_millis(350));
         toolbar(theme)
             .pr(px(crate::surface_chrome::CONTROL_GAP))
+            .child(
+                crate::file_icons::icon(
+                    crate::file_icons::FileIconIdentity::file(path),
+                    theme.appearance,
+                )
+                .size(px(14.0))
+                .flex_none(),
+            )
             .child(crumbs)
             .when(markdown, |element| {
                 element.child(
@@ -2243,21 +2302,8 @@ impl FilesSurface {
             })
             .child(
                 toolbar_button("files-reveal-active", "Reveal file in tree")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let name = reveal_path
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&reveal_path)
-                            .to_string();
-                        this.reveal_search_result(
-                            WorkspaceFileSearchMatch {
-                                path: reveal_path.clone(),
-                                name,
-                                kind: zeron_proto::WorkspaceEntryKind::File,
-                                score: 0,
-                            },
-                            cx,
-                        );
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.emit(FilesEvent::RevealFile(reveal_path.clone()));
                     }))
                     .child(
                         icon(icons::FOLDER)
@@ -2291,6 +2337,17 @@ impl FilesSurface {
             .into_any_element()
     }
 
+    fn markdown_web_link_handler(cx: &Context<Self>) -> super::markdown_preview::WebLinkHandler {
+        let owner = cx.weak_entity();
+        Rc::new(move |activation, cx| {
+            let _ = owner.update(cx, |surface, cx| {
+                let mut activation = activation.clone();
+                activation.source_session = Some(surface.chat_id.clone());
+                cx.emit(FilesEvent::OpenWebLink(activation));
+            });
+        })
+    }
+
     fn prepare_markdown_preview(
         &mut self,
         path: &str,
@@ -2314,15 +2371,18 @@ impl FilesSurface {
             .markdown
             .get_or_insert_with(|| {
                 let owner = cx.weak_entity();
+                let web_links = Self::markdown_web_link_handler(cx);
                 cx.new(|cx| {
-                    super::markdown_preview::MarkdownPreview::new(
+                    let mut view = super::markdown_preview::MarkdownPreview::new(
                         path.to_string(),
                         Rc::new(move |path, cx| {
                             let _ =
                                 owner.update(cx, |surface, cx| surface.open_tree_file(path, cx));
                         }),
                         cx,
-                    )
+                    );
+                    view.set_web_link_handler(web_links);
+                    view
                 })
             })
             .clone();
@@ -2389,7 +2449,16 @@ impl FilesSurface {
             .comment_draft
             .as_ref()
             .filter(|draft| draft.path == path && draft.key == self.chat_id)
-            .map(|draft| (draft.line, draft.input.clone()));
+            .map(|draft| (draft.line, draft.input.clone(), draft.editing_id.is_some()));
+        let editing_id = self
+            .preview
+            .comment_draft
+            .as_ref()
+            .and_then(|draft| draft.editing_id.as_ref());
+        let comments = comments
+            .into_iter()
+            .filter(|comment| Some(&comment.id) != editing_id)
+            .collect();
         let owner = cx.weak_entity();
         view.update(cx, |view, cx| view.set_comments(owner, comments, draft, cx));
     }
@@ -2401,6 +2470,22 @@ impl FilesSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self.target_change_pending && super::image_preview::is_image(path) {
+            return centered_state(
+                "Workspace changed. Image preview suspended.",
+                theme.text_muted,
+            );
+        }
+        self.preview.images_visible = true;
+        if let Some(view) = self
+            .preview
+            .documents
+            .get(path)
+            .and_then(|d| d.image.clone())
+        {
+            view.update(cx, |view, cx| view.activate(cx));
+            return view.into_any_element();
+        }
         self.apply_pending_external_reload(path, window, cx);
         let editor = self.ensure_editor(path, theme, window, cx);
         if let Some(editor) = &editor {
@@ -2432,9 +2517,9 @@ impl FilesSurface {
                 .relative()
                 .overflow_hidden()
                 .font_family(theme.font_mono.clone())
-                .text_size(px(self.preview.editor_font_size))
+                .text_size(px(self.preview.editor_text_size()))
                 .line_height(px(
-                    (self.preview.editor_font_size + 8.5).max(PREVIEW_LINE_HEIGHT)
+                    (self.preview.editor_text_size() + 8.5).max(PREVIEW_LINE_HEIGHT)
                 ))
                 .child(super::editor::editor_element(&editor))
                 .children(overlays)
@@ -2635,6 +2720,7 @@ impl FilesSurface {
         theme: &Theme,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let theme = &theme.for_popup();
         let group: SharedString = format!("file-comment-card-{}", comment.id).into();
         let id = comment.id.clone();
         let card = crate::popover::popover_card_flush(theme)
@@ -2671,6 +2757,13 @@ impl FilesSurface {
                             .text_color(theme.text_faint)
                             .child(SharedString::from(comment.location())),
                     )
+                    .child(crate::comment_ui::render_comment_edit(
+                        &comment,
+                        group.clone(),
+                        theme,
+                        cx,
+                        Self::edit_editor_comment,
+                    ))
                     .child(
                         div()
                             .id(SharedString::from(format!(
@@ -2719,7 +2812,14 @@ impl FilesSurface {
         theme: &Theme,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let theme = &theme.for_popup();
         let card = crate::popover::popover_card_flush(theme)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    this.cancel_editor_comment(cx);
+                }
+            }))
             .absolute()
             .left(px(left))
             .top(px(top))
@@ -2757,8 +2857,22 @@ impl FilesSurface {
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_editor_comment(cx))),
                     )
                     .child(
-                        editor_comment_action("file-comment-commit", "Comment", true, theme)
-                            .on_click(cx.listener(|this, _, _, cx| this.commit_editor_comment(cx))),
+                        editor_comment_action(
+                            "file-comment-commit",
+                            if self
+                                .preview
+                                .comment_draft
+                                .as_ref()
+                                .is_some_and(|draft| draft.editing_id.is_some())
+                            {
+                                "Save"
+                            } else {
+                                "Comment"
+                            },
+                            true,
+                            theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.commit_editor_comment(cx))),
                     ),
             );
         crate::frost::frosted(crate::popover::CARD_RADIUS, crate::frost::MENU_BLUR, card)
@@ -2849,16 +2963,14 @@ impl FilesSurface {
             theme.text.opacity(0.93),
             &theme,
         );
+        let row_height = self.preview.line_height();
         div()
-            .min_h(px(PREVIEW_LINE_HEIGHT))
+            .min_h(row_height)
             .flex_none()
             .flex()
             .when(word_wrap, |element| element.w_full().items_stretch())
             .when(!word_wrap, |element| {
-                element
-                    .h(px(PREVIEW_LINE_HEIGHT))
-                    .min_w_full()
-                    .items_center()
+                element.h(row_height).min_w_full().items_center()
             })
             .child(
                 div()
@@ -2885,41 +2997,11 @@ impl FilesSurface {
                     .pr(px(18.0))
                     .when(!word_wrap, |element| element.whitespace_nowrap())
                     .font_family(theme.font_mono.clone())
-                    .text_size(px(11.5))
+                    // Same source `row_height` derives from; a second reading of
+                    // the code size could drift from the geometry the glyphs
+                    // are measured against.
+                    .text_size(px(self.preview.preview_text_size()))
                     .child(gpui::StyledText::new(line.clone()).with_runs(runs)),
-            )
-            .into_any_element()
-    }
-
-    pub(super) fn on_preview_split_drag(
-        &mut self,
-        event: &gpui::DragMoveEvent<PreviewSplitResize>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let width = f32::from(event.bounds.right() - event.event.position.x);
-        self.preview.tree_width = width.clamp(220.0, 360.0);
-        cx.notify();
-    }
-
-    pub(super) fn preview_split_handle(&self, cx: &mut Context<Self>) -> AnyElement {
-        let color = Theme::of(cx).border_strong;
-        div()
-            .id("files-preview-split")
-            .absolute()
-            .left(px(-3.0))
-            .top_0()
-            .bottom_0()
-            .w(px(6.0))
-            .occlude()
-            .cursor_col_resize()
-            .hover(move |style| style.bg(color))
-            .on_drag(
-                PreviewSplitResize,
-                |_, _point: Point<gpui::Pixels>, _, cx| {
-                    cx.stop_propagation();
-                    cx.new(|_| PreviewDragGhost)
-                },
             )
             .into_any_element()
     }
@@ -3018,6 +3100,49 @@ fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
 mod tests {
     use super::*;
 
+    // Rendering a preview needs a window, so this asserts on `line_height`,
+    // the single source both the uniform-height hint passed to
+    // `reset_with_uniform_height` and the painted row in
+    // `render_preview_line` read.
+    #[test]
+    fn preview_rows_track_the_code_font_size_from_the_default_to_the_maximum() {
+        let default = FilePreviewState::new(false, 900, false, 12.5);
+        assert_eq!(default.line_height(), px(PREVIEW_LINE_HEIGHT));
+
+        let maximum = FilePreviewState::new(false, 900, false, 32.0);
+        assert!(maximum.line_height() > px(PREVIEW_LINE_HEIGHT));
+
+        let minimum = FilePreviewState::new(false, 900, false, 8.0);
+        assert_eq!(minimum.line_height(), px(PREVIEW_LINE_HEIGHT));
+    }
+
+    /// The regression this guards: collapsing both surfaces onto the raw
+    /// setting silently resized them on a fresh install.
+    #[test]
+    fn the_default_code_font_size_reproduces_the_historical_per_surface_sizes() {
+        let default =
+            FilePreviewState::new(false, 900, false, crate::typography::CODE_FONT_SIZE_DEFAULT);
+        assert_eq!(default.editor_text_size(), 13.0);
+        assert_eq!(default.preview_text_size(), 11.5);
+    }
+
+    #[test]
+    fn scaled_preview_sizes_keep_their_proportions_and_stay_clamped() {
+        let doubled = FilePreviewState::new(
+            false,
+            900,
+            false,
+            2.0 * crate::typography::CODE_FONT_SIZE_DEFAULT,
+        );
+        assert_eq!(doubled.editor_text_size(), 26.0);
+        assert_eq!(doubled.preview_text_size(), 23.0);
+
+        // The editor ratio is >1, so the maximum setting would overshoot.
+        let maximum = FilePreviewState::new(false, 900, false, crate::typography::FONT_SIZE_MAX);
+        assert_eq!(maximum.editor_text_size(), crate::typography::FONT_SIZE_MAX);
+        assert!(maximum.preview_text_size() < crate::typography::FONT_SIZE_MAX);
+    }
+
     fn cached_document(path: &str, text: &str) -> FileDocument {
         let mut document = FileDocument::loading(DocumentKey {
             chat_id: "chat-1".into(),
@@ -3055,13 +3180,11 @@ mod tests {
             .get_mut("private.env")
             .unwrap()
             .mark_external(None);
-        preview.tree_sidebar_visible = true;
 
         preview.reset();
 
         assert!(preview.documents.is_empty());
         assert!(preview.active.is_none());
-        assert!(!preview.tree_sidebar_visible);
     }
 
     #[test]
@@ -3252,113 +3375,6 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_layout_changes_are_immediate_without_a_user_toggle() {
-        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
-        let now = Instant::now();
-        assert_eq!(
-            preview
-                .tree_motion
-                .sample(preview.tree_sidebar_visible(), now, false),
-            (0.0, false)
-        );
-        // A newly opened surface measures its width after the first render.
-        preview.surface_width.set(WIDE_BREAKPOINT);
-        assert_eq!(
-            preview
-                .tree_motion
-                .sample(preview.tree_sidebar_visible(), now, false),
-            (1.0, false)
-        );
-        preview.surface_width.set(WIDE_BREAKPOINT - 1.0);
-        assert_eq!(
-            preview
-                .tree_motion
-                .sample(preview.tree_sidebar_visible(), now, false),
-            (0.0, false)
-        );
-        preview.show_tree_sidebar();
-        assert_eq!(
-            preview
-                .tree_motion
-                .sample(preview.tree_sidebar_visible(), now, false),
-            (1.0, false)
-        );
-        preview.toggle_tree_sidebar();
-        let started = preview.tree_motion.started.unwrap();
-        assert_eq!(
-            preview
-                .tree_motion
-                .sample(preview.tree_sidebar_visible(), started, false),
-            (1.0, true)
-        );
-    }
-
-    #[test]
-    fn sidebar_motion_reverses_from_its_current_width() {
-        let mut motion = TreeSidebarMotion::default();
-        let now = Instant::now();
-        assert_eq!(motion.sample(true, now, false), (1.0, false));
-        motion.animate_to(true, false, now);
-        assert_eq!(motion.sample(false, now, false), (1.0, true));
-        let midway = now
-            + crate::motion::RESIZE
-                .total()
-                .mul_f32(crate::motion::speed_scale() * 0.4);
-        let closing = motion.sample(false, midway, false).0;
-        assert!(closing > 0.0 && closing < 1.0);
-        motion.animate_to(false, true, midway);
-        assert_eq!(motion.sample(true, midway, false), (closing, true));
-        assert_eq!(
-            motion.sample(true, midway + Duration::from_secs(10), false),
-            (1.0, false)
-        );
-        motion.animate_to(true, false, midway + Duration::from_secs(10));
-        assert_eq!(
-            motion.sample(false, midway + Duration::from_secs(20), false),
-            (0.0, false)
-        );
-    }
-
-    #[test]
-    fn sidebar_motion_snaps_when_reduced_motion_is_enabled() {
-        let mut motion = TreeSidebarMotion::default();
-        let now = Instant::now();
-        motion.sample(true, now, false);
-        motion.animate_to(true, false, now);
-        assert_eq!(motion.sample(false, now, true), (0.0, false));
-        assert_eq!(motion.sample(true, now, true), (1.0, false));
-        assert_eq!(motion.sample(true, now, false), (1.0, false));
-    }
-
-    #[test]
-    fn wide_layout_respects_an_explicitly_hidden_tree_sidebar() {
-        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
-        preview.surface_width.set(WIDE_BREAKPOINT);
-
-        assert!(preview.tree_sidebar_visible());
-
-        preview.toggle_tree_sidebar();
-        assert!(!preview.tree_sidebar_visible());
-
-        preview.surface_width.set(WIDE_BREAKPOINT - 1.0);
-        preview.surface_width.set(WIDE_BREAKPOINT);
-        assert!(!preview.tree_sidebar_visible());
-    }
-
-    #[test]
-    fn explicitly_showing_tree_sidebar_clears_responsive_dismissal() {
-        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
-        preview.surface_width.set(WIDE_BREAKPOINT);
-        preview.toggle_tree_sidebar();
-
-        preview.show_tree_sidebar();
-
-        assert!(preview.tree_sidebar_visible());
-        preview.tree_sidebar_visible = false;
-        assert!(preview.tree_sidebar_visible());
-    }
-
-    #[test]
     fn dirty_reload_waits_for_explicit_discard_confirmation() {
         let path = "src/lib.rs";
         let mut preview = FilePreviewState::new(false, 900, false, 11.5);
@@ -3508,6 +3524,20 @@ mod tests {
 
 #[cfg(test)]
 impl FilesSurface {
+    pub(crate) fn test_document_text(&self, path: &str) -> Option<String> {
+        self.preview
+            .documents
+            .get(path)?
+            .file
+            .as_ref()?
+            .text
+            .clone()
+    }
+
+    pub(crate) fn test_document_phase(&self, path: &str) -> Option<String> {
+        Some(format!("{:?}", self.preview.documents.get(path)?.phase))
+    }
+
     pub(crate) fn seed_pending_exit_test_document(&mut self, failed: bool) {
         let mut document = FileDocument::loading(DocumentKey {
             chat_id: "test".into(),
@@ -3708,6 +3738,68 @@ mod markdown_buffer_tests {
                     assert_eq!(staged[0].line, 3);
                     assert_eq!(staged[0].body, "Clarify this paragraph");
                     assert!(staged[0].is_file());
+                    for save in [false, true] {
+                        cx.update_window(window.into(), |_, window, cx| {
+                            window.refresh();
+                            let _ = window.draw(cx);
+                            let bounds = view.read(cx).test_block_bounds(1);
+                            let gutter = ((bounds.size.width - px(900.0)) / 2.0).max(px(24.0));
+                            click(
+                                window,
+                                gpui::point(
+                                    bounds.right() - gutter - px(30.0),
+                                    bounds.bottom()
+                                        - px(12.0)
+                                        - px(comments::card_height(&staged[0].body))
+                                        + px(21.0),
+                                ),
+                                cx,
+                            );
+                            let input = owner
+                                .read(cx)
+                                .preview
+                                .comment_draft
+                                .as_ref()
+                                .expect("Edit reopens the comment input")
+                                .input
+                                .clone();
+                            assert_eq!(input.read(cx).text(), staged[0].body);
+                            assert!(input.read(cx).focus_handle(cx).is_focused(window));
+                            input.update(cx, |input, cx| input.set_text("Revised paragraph", cx));
+                            window.refresh();
+                            let _ = window.draw(cx);
+                            if save {
+                                let bounds = view.read(cx).test_block_bounds(1);
+                                click(
+                                    window,
+                                    gpui::point(
+                                        bounds.right() - gutter - px(22.0),
+                                        bounds.bottom() - px(36.0),
+                                    ),
+                                    cx,
+                                );
+                            } else {
+                                window.dispatch_event(
+                                    gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                                        keystroke: gpui::Keystroke::parse("escape").unwrap(),
+                                        is_held: false,
+                                        prefer_character_input: false,
+                                    }),
+                                    cx,
+                                );
+                            }
+                        })
+                        .unwrap();
+                        assert!(owner.read(cx).preview.comment_draft.is_none());
+                        let mut expected = staged[0].clone();
+                        if save {
+                            expected.body = "Revised paragraph".into();
+                        }
+                        assert_eq!(
+                            owner.read(cx).staged_file_comments("README.md", cx),
+                            vec![expected]
+                        );
+                    }
                     let editor = owner.read(cx).preview.documents["README.md"]
                         .editor
                         .clone()
@@ -3719,11 +3811,12 @@ mod markdown_buffer_tests {
                         let _ = window.draw(cx);
                         let bounds = view.read(cx).test_block_bounds(1);
                         let gutter = ((bounds.size.width - px(900.0)) / 2.0).max(px(24.0));
-                        // The stored card uses the same remove action as a diff card.
+                        // The 16px remove button ends at the reading column's right edge.
+                        // Click its center; Markdown cards have no inner horizontal padding.
                         click(
                             window,
                             gpui::point(
-                                bounds.right() - gutter - px(24.0),
+                                bounds.right() - gutter - px(8.0),
                                 bounds.bottom()
                                     - px(12.0)
                                     - px(comments::card_height("Clarify this paragraph"))
@@ -3772,6 +3865,331 @@ mod markdown_buffer_tests {
             })
             .detach();
         });
+    }
+
+    #[gpui::test]
+    fn editing_file_comments_keeps_the_live_anchor(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            FilesSurface::new(state, "chat".into(), false, 1000, 13.0, false, false, cx)
+        });
+        window
+            .update(cx, |surface, window, cx| {
+                let theme = Theme::of(cx).clone();
+                let editor = super::super::editor::new_file_editor(
+                    "first\nsecond\nthird\n",
+                    "a.rs",
+                    false,
+                    &theme,
+                    window,
+                    cx,
+                );
+                let mut document = FileDocument::loading(DocumentKey {
+                    chat_id: "chat".into(),
+                    checkout_id: None,
+                    path: "a.rs".into(),
+                });
+                document.editor = Some(editor.clone());
+                surface.preview.documents.insert("a.rs".into(), document);
+                let original = ReviewComment::file("a.rs", 2, "Original 🦀\nSecond line");
+                surface.state.update(cx, |state, _| {
+                    state.add_review_comment("chat", original.clone())
+                });
+                surface.sync_editor_comment_anchors("a.rs", &editor, cx);
+                let anchor = surface.preview.comment_anchors["a.rs"][&original.id]
+                    .range
+                    .clone();
+
+                surface.edit_editor_comment(&original.id, window, cx);
+                let input = surface
+                    .preview
+                    .comment_draft
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .clone();
+                assert_eq!(input.read(cx).text(), original.body);
+                assert!(input.read(cx).focus_handle(cx).is_focused(window));
+                input.update(cx, |input, cx| input.set_text("Cancelled", cx));
+                assert_eq!(
+                    surface.staged_file_comments("a.rs", cx),
+                    vec![original.clone()]
+                );
+                surface.cancel_editor_comment(cx);
+                assert_eq!(
+                    surface.staged_file_comments("a.rs", cx),
+                    vec![original.clone()]
+                );
+                assert_eq!(
+                    surface.preview.active_comment.as_deref(),
+                    Some(original.id.as_str())
+                );
+
+                surface.edit_editor_comment(&original.id, window, cx);
+                // Move the existing editor decoration while the body is being edited.
+                let (range, _) = comment_anchor_range(editor.read(cx).text(), 3).unwrap();
+                anchor.set(
+                    vec![TextDecoration::new(range, HighlightStyle::default())],
+                    cx,
+                );
+                surface.sync_editor_comment_lines("a.rs", &editor, cx);
+                assert_eq!(surface.preview.comment_draft.as_ref().unwrap().line, 3);
+                surface
+                    .preview
+                    .comment_draft
+                    .as_ref()
+                    .unwrap()
+                    .input
+                    .clone()
+                    .update(cx, |input, cx| {
+                        input.set_text("  Revised\nMore detail  ", cx)
+                    });
+                surface.commit_editor_comment(cx);
+                let mut expected = original.clone();
+                expected.line = 3;
+                expected.body = "Revised\nMore detail".into();
+                assert_eq!(surface.staged_file_comments("a.rs", cx), vec![expected]);
+                // The original decoration handle still controls the stored anchor.
+                let (range, _) = comment_anchor_range(editor.read(cx).text(), 1).unwrap();
+                anchor.set(
+                    vec![TextDecoration::new(range, HighlightStyle::default())],
+                    cx,
+                );
+                surface.sync_editor_comment_lines("a.rs", &editor, cx);
+                assert_eq!(surface.staged_file_comments("a.rs", cx)[0].line, 1);
+
+                surface.edit_editor_comment(&original.id, window, cx);
+                let sent = surface
+                    .state
+                    .update(cx, |state, _| state.take_review_comments("chat"));
+                assert!(comments::with_comments("", &sent).contains("Revised\n  More detail"));
+                surface.commit_editor_comment(cx);
+                assert!(surface.staged_file_comments("a.rs", cx).is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn image_rename_preserves_unsaved_text_on_reopen_and_watcher(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            FilesSurface::new(state, "chat".into(), false, 1000, 13.0, false, false, cx)
+        });
+        window
+            .update(cx, |surface, window, cx| {
+                surface.request_context = Some(FilesRequestContext {
+                    target: zeron_proto::WorkspaceTarget {
+                        chat_id: Some("chat".into()),
+                        space_id: None,
+                        checkout_path: None,
+                    },
+                    target_device_id: None,
+                    cwd: "/workspace".into(),
+                    checkout_id: Some("checkout".into()),
+                });
+                let mut document = FileDocument::loading(DocumentKey {
+                    chat_id: "chat".into(),
+                    checkout_id: Some("checkout".into()),
+                    path: "drawing.txt".into(),
+                });
+                document.set_loaded(zeron_proto::WorkspaceFileText {
+                    checkout_id: "checkout".into(),
+                    path: "drawing.txt".into(),
+                    text: Some("disk text".into()),
+                    content_hash: Some("disk-hash".into()),
+                    size: 9,
+                    modified_at: None,
+                    encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+                    line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+                    read_only_reason: None,
+                    truncated: false,
+                });
+                let theme = Theme::of(cx).clone();
+                let editor = super::super::editor::new_file_editor(
+                    "unsaved text",
+                    "drawing.txt",
+                    false,
+                    &theme,
+                    window,
+                    cx,
+                );
+                document.editor = Some(editor.clone());
+                document.mark_user_edit();
+                surface.preview.active = Some("drawing.txt".into());
+                surface
+                    .preview
+                    .documents
+                    .insert("drawing.txt".into(), document);
+                surface.rename_documents("drawing.txt", "drawing.svg".into(), cx);
+                surface.open_file("drawing.svg".into(), cx);
+                surface.reconcile_document("drawing.svg".into(), cx);
+                let document = surface.preview.documents.get_mut("drawing.svg").unwrap();
+                assert!(document.is_dirty());
+                assert!(document.is_editable());
+                assert_eq!(document.editor.as_ref(), Some(&editor));
+                assert!(document.image.is_none());
+                assert!(matches!(
+                    document.phase,
+                    DocumentPhase::ExternallyModified { .. }
+                ));
+                // After resolving the external-change warning, saving still uses
+                // the original buffer and cannot be cancelled by preview creation.
+                document.phase = DocumentPhase::Ready;
+                assert!(document.can_save());
+                let pending = document.begin_save("unsaved text".into()).unwrap();
+                surface.read_image_file("drawing.svg".into(), cx);
+                let document = &surface.preview.documents["drawing.svg"];
+                assert_eq!(document.pending_save.as_ref(), Some(&pending));
+                assert_eq!(document.editor.as_ref(), Some(&editor));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn markdown_preview_web_links_keep_the_file_session_and_full_target(cx: &mut TestAppContext) {
+        use crate::markdown::render::{self, LinkAction, LinkTarget};
+        use std::cell::RefCell;
+
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            FilesSurface::new(state, "owner".into(), false, 1000, 13.0, false, false, cx)
+        });
+        let (owner, preview) = window
+            .update(cx, |surface, _, cx| {
+                let mut document = FileDocument::loading(DocumentKey {
+                    chat_id: "owner".into(),
+                    checkout_id: Some("checkout".into()),
+                    path: "README.md".into(),
+                });
+                document.set_loaded(zeron_proto::WorkspaceFileText {
+                    checkout_id: "checkout".into(),
+                    path: "README.md".into(),
+                    text: Some("[Docs](https://example.com/docs)".into()),
+                    content_hash: Some("hash".into()),
+                    size: 32,
+                    modified_at: None,
+                    encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+                    line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+                    read_only_reason: None,
+                    truncated: false,
+                });
+                document.show_markdown = true;
+                surface.preview.active = Some("README.md".into());
+                surface
+                    .preview
+                    .documents
+                    .insert("README.md".into(), document);
+                let preview = surface
+                    .prepare_markdown_preview("README.md", None, cx)
+                    .unwrap();
+                // Changing the selected chat must not rewrite this file's owner.
+                surface
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("other".into()));
+                (cx.entity(), preview)
+            })
+            .unwrap();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&owner, {
+                let received = received.clone();
+                let preview = preview.clone();
+                move |_, event, cx| {
+                    if let FilesEvent::OpenWebLink(activation) = event {
+                        received.borrow_mut().push(activation.clone());
+                        // Browser selection can suspend this same preview. This
+                        // must run after its owner/preview borrows have unwound.
+                        preview.update(cx, |preview, cx| preview.suspend(cx));
+                    }
+                }
+            })
+        });
+        let ui = preview.update(cx, |preview, cx| preview.link_ui(cx));
+        assert!(
+            ui.source_session.is_none(),
+            "file preview labels are not truncated"
+        );
+        let target = LinkTarget::new("Different label", "https://example.com/docs?q=%C3%B1#full");
+        for action in [
+            LinkAction::Primary,
+            LinkAction::Internal,
+            LinkAction::External,
+            LinkAction::Copy,
+        ] {
+            cx.update_window(window.into(), |_, window, cx| {
+                render::activate_link(target.clone(), action, Some(&ui), window, cx);
+            })
+            .unwrap();
+        }
+        cx.run_until_parked();
+        let events = received.borrow();
+        assert_eq!(events.len(), 3);
+        for (event, action) in events.iter().zip([
+            LinkAction::Primary,
+            LinkAction::Internal,
+            LinkAction::External,
+        ]) {
+            assert_eq!(event.target, target);
+            assert_eq!(event.action, action);
+            assert_eq!(event.source_session.as_deref(), Some("owner"));
+        }
+        drop(events);
+        cx.update(|cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some(target.original.as_str())
+            )
+        });
+        assert!(
+            cx.opened_url().is_none(),
+            "only the shell may open web destinations"
+        );
+        for url in [
+            "javascript:alert(1)",
+            "https://user:secret@example.com",
+            "https://example.com/%ZZ",
+            "https://example.com/\n",
+        ] {
+            for action in [LinkAction::Internal, LinkAction::External] {
+                cx.update_window(window.into(), |_, window, cx| {
+                    render::activate_link(
+                        LinkTarget::new("Bad", url),
+                        action,
+                        Some(&ui),
+                        window,
+                        cx,
+                    );
+                })
+                .unwrap();
+            }
+        }
+        cx.run_until_parked();
+        assert_eq!(received.borrow().len(), 3);
+        assert!(cx.opened_url().is_none());
+        // Mail links retain their existing OS handler.
+        cx.update_window(window.into(), |_, window, cx| {
+            render::activate_link(
+                LinkTarget::new("Mail", "mailto:hello@example.com"),
+                LinkAction::Internal,
+                Some(&ui),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+        assert_eq!(cx.opened_url().as_deref(), Some("mailto:hello@example.com"));
     }
 
     #[gpui::test]

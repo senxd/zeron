@@ -31,8 +31,10 @@ use zeron_proto::{
 };
 use zeron_rpc::{RpcError, methods};
 
+use crate::appshots::{self, CapturedAppshot};
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
+use crate::notice::{NoticeChipIcon, notice_chip};
 use crate::pickers::Pickers;
 use crate::settings::{ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, Indicator};
@@ -68,12 +70,27 @@ pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BO
 /// compact cluster (`py-1.5` + h-8 = 44) is shorter, so the textarea wins.
 pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
 /// `max-w-3xl`: stable outer width of the centered composer column.
-const COMPOSER_MAX_WIDTH: f32 = 768.0;
+pub const COMPOSER_MAX_WIDTH: f32 = 768.0;
 /// The queue reads as a narrower tray emerging from behind the composer.
 const QUEUE_SIDE_INSET: f32 = 16.0;
 /// The composer covers the tray's lower padding so the queue reads as emerging
 /// from behind it instead of as a separate rounded pill.
 pub(crate) const QUEUE_COMPOSER_OVERLAP: f32 = 18.0;
+/// The original floating selector rows use the same 20px chip height as the
+/// established-thread footer. Their surrounding rows own no plate or border.
+const NEW_THREAD_SELECTOR_ROW_HEIGHT: f32 = 20.0;
+// Accommodate the 24px usage indicator and PR badge without overflowing the
+// row's equal 8px top/bottom gutters.
+const SESSION_FOOTER_HEIGHT: f32 = 24.0;
+
+/// Route chrome dissolves around the middle of the shared-element move. The
+/// two ramps never overlap, which avoids duplicate picker ids/popovers while
+/// still letting their surrounding geometry collapse continuously.
+fn route_chrome_opacities(new_thread_chrome: f32) -> (f32, f32) {
+    let new_thread = ((new_thread_chrome.clamp(0.0, 1.0) - 0.5) * 2.0).clamp(0.0, 1.0);
+    let session = (((1.0 - new_thread_chrome.clamp(0.0, 1.0)) - 0.5) * 2.0).clamp(0.0, 1.0);
+    (new_thread, session)
+}
 /// Ignore subpixel noise when the shell reports the conversation width.
 const COMPOSER_WIDTH_EPSILON: f32 = 0.5;
 /// Below this pill input width the composer always expands.
@@ -297,9 +314,10 @@ pub fn comment_strip_height(count: usize) -> f32 {
 /// Compact↔expanded flip morph (round 9): the flip used to snap between the
 /// two pill layouts. The original has no height transition (its shell carries
 /// only `transition-colors`), so this is a native nicety: ONE committed flip
-/// starts exactly one 180ms ease-out morph ([`motion::COLLAPSE`], the same
-/// manual-drive pattern as shell.rs `WidthTween` — never `with_animation`,
-/// whose element-id keying replays tweens on remount, round-6 §1–3).
+/// starts exactly one 180ms ease-out morph ([`motion::COLLAPSE`]); the blank-
+/// thread handoff swaps in the coordinated 420ms route-transition spec. Both use the
+/// manual-drive pattern from shell.rs `WidthTween` — never `with_animation`,
+/// whose element-id keying replays tweens on remount, round-6 §1–3.
 ///
 /// The morph animates the pill's COMMITTED height: the flip commits its final
 /// layout immediately (the input entity never remounts — the caret survives,
@@ -316,18 +334,37 @@ pub struct FlipMorph {
     pub from: f32,
     /// Commit time in ms on the caller's monotonic clock.
     pub start_ms: f32,
+    /// Ordinary typing flips use the quick collapse spec; the first-send
+    /// handoff uses the shell's longer coordinated route timeline.
+    pub spec: motion::MotionSpec,
 }
 
 impl FlipMorph {
-    /// Raw timeline position 0..1 over [`motion::COLLAPSE`]'s 180ms.
+    fn collapse(from: f32, start_ms: f32) -> Self {
+        Self {
+            from,
+            start_ms,
+            spec: motion::COLLAPSE,
+        }
+    }
+
+    fn new_thread_transition(from: f32, start_ms: f32) -> Self {
+        Self {
+            from,
+            start_ms,
+            spec: motion::NEW_THREAD_TRANSITION,
+        }
+    }
+
+    /// Raw timeline position 0..1 over this morph's motion spec.
     fn raw(&self, now_ms: f32) -> f32 {
-        let total = motion::COLLAPSE.total().as_secs_f32() * 1000.0;
+        let total = self.spec.total().as_secs_f32() * 1000.0;
         ((now_ms - self.start_ms) / total).clamp(0.0, 1.0)
     }
 
-    /// Eased progress 0..1 (ease-out) — also drives the actions fade.
+    /// Eased progress 0..1 — also drives the inner geometry handoff.
     pub fn progress(&self, now_ms: f32) -> f32 {
-        motion::COLLAPSE.progress(self.raw(now_ms))
+        self.spec.progress(self.raw(now_ms))
     }
 
     pub fn done(&self, now_ms: f32) -> bool {
@@ -351,18 +388,14 @@ impl FlipMorph {
 // expanded, a bottom-justified row when compact) and only the TEXT glides
 // with the sweeping top edge. The helpers below are the pure math.
 
-/// Send/attach center sits 27px above the pill's outer bottom in expanded
-/// mode (`pb-2.5` 10 + half the 32px content zone + 1px hairline) but 24.5px
-/// in compact (centered in the 47px row) — an inherent 2.5px delta between
-/// the two SOURCE geometries. The morph glides it instead of snapping.
-pub const CLUSTER_Y_DELTA: f32 = 2.5;
+/// Send/attach center sits 29px above the expanded pill's bottom (12px
+/// padding + half the 32px control zone + 1px border), versus 24.5px in
+/// compact. The morph glides this optical adjustment instead of snapping.
+pub const CLUSTER_Y_DELTA: f32 = 4.5;
 
-/// The cluster's INTERNAL geometry is mode-independent. Reasoning/service
-/// tier and attachment form one utility group; Send is a distinct primary
-/// action. Both layouts reuse these distances so the flip cannot create a
-/// horizontal compression pulse.
-/// Only the wrapper's right inset differs: `pr-2` (8) compact vs `px-3` (12)
-/// expanded — a whole-cluster 4px shift that glides with the morph.
+/// Send's right inset differs between compact (8px) and expanded (12px).
+/// Glide this four-pixel shift during the morph. Attachment stays on the
+/// left; the model picker fades between the left and right groups.
 pub const CLUSTER_X_DELTA: f32 = 4.0;
 /// Optical join between the picker group and the paperclip. This is tighter
 /// than the structural spacing ladder because the narrow paperclip glyph
@@ -371,9 +404,19 @@ pub const ACTION_UTILITY_GAP: f32 = 2.0;
 /// Structural separation between utility actions and the primary Send action.
 pub const ACTION_PRIMARY_GAP: f32 = Theme::SPACE_SM;
 
+/// Fade out at the old endpoint, relocate while invisible, then fade in at
+/// the new endpoint. Only a six-pixel nudge is visible; a long label never
+/// sweeps across the prompt. Compact amount is reversible with the shared clock.
+fn model_handoff(compact: f32) -> (f32, f32, f32) {
+    let compact = compact.clamp(0.0, 1.0);
+    let side = if compact < 0.5 { 0.0 } else { 1.0 };
+    let opacity = ((compact - 0.5).abs() - 0.06).max(0.0) / 0.44;
+    let drift = (1.0 - opacity) * if side == 0.0 { 6.0 } else { -6.0 };
+    (side, opacity, drift)
+}
+
 /// The right inset for the in-flight morph: eases from the OLD mode's resting
-/// inset to the committed mode's (compact 8 ↔ expanded 12) — pairwise button
-/// distances stay constant; the cluster glides as one.
+/// inset to the committed mode's (compact 8 ↔ expanded 12).
 pub fn morph_cluster_inset(expanded: bool, progress: f32) -> f32 {
     let (from, to) = if expanded {
         (8.0, 8.0 + CLUSTER_X_DELTA)
@@ -400,10 +443,8 @@ pub fn collapse_text_glide(from: f32, progress: f32) -> f32 {
 }
 
 /// The decaying [`CLUSTER_Y_DELTA`] offset for the in-flight morph.
-/// The whole control cluster — chips AND attach/send — rides the stationary
-/// bottom anchor at FULL alpha throughout (round-9 follow-up: any fade on the
-/// picker chips read as flicker; their screen position is near-stationary
-/// across the flip, so nothing needs to be hidden).
+/// Controls share this bottom anchor; the model's horizontal fade is applied
+/// independently so its endpoint matches Attachment and Send.
 pub fn morph_cluster_dy(progress: f32) -> f32 {
     CLUSTER_Y_DELTA * (1.0 - progress)
 }
@@ -443,10 +484,7 @@ pub fn flip_morph_step(
     if reduced_motion || last_height <= 0.0 {
         return None;
     }
-    Some(FlipMorph {
-        from: last_height,
-        start_ms: now_ms,
-    })
+    Some(FlipMorph::collapse(last_height, now_ms))
 }
 
 /// Engines at or above this version understand `pending://` attachment refs
@@ -477,14 +515,64 @@ pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModifiedSubmitTarget {
     SubmitContent,
-    ActivateQueueHead,
+    ActivateLatestQueued,
 }
 
 fn modified_submit_target(has_content: bool) -> ModifiedSubmitTarget {
     if has_content {
         ModifiedSubmitTarget::SubmitContent
     } else {
-        ModifiedSubmitTarget::ActivateQueueHead
+        ModifiedSubmitTarget::ActivateLatestQueued
+    }
+}
+
+pub const APPSHOT_TILE_MIN_WIDTH: f32 = 96.0;
+pub const APPSHOT_IMAGE_INSET: f32 = 12.0;
+pub const APPSHOT_PREVIEW_HEIGHT: f32 = 148.0;
+pub const APPSHOT_IMAGE_MAX_WIDTH: f32 = 320.0;
+pub const APPSHOT_IMAGE_MAX_HEIGHT: f32 = 132.0;
+pub const APPSHOT_TILE_HEIGHT: f32 = 192.0;
+
+struct AppshotActionTooltip(SharedString);
+
+impl Render for AppshotActionTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(px(11.0))
+            .text_color(theme.text)
+            .child(self.0.clone())
+    }
+}
+
+/// Give ordinary captures a shared height while their width follows the
+/// source window. Extreme panoramas and narrow composers cap width without
+/// cropping. Explicit dimensions also bound the native image while decoding.
+pub fn appshot_contained_size(dimensions: Option<(u32, u32)>, max_width: f32) -> (f32, f32) {
+    let max_width = if max_width.is_finite() {
+        max_width.clamp(1.0, APPSHOT_IMAGE_MAX_WIDTH)
+    } else {
+        APPSHOT_IMAGE_MAX_WIDTH
+    };
+    let (width, height) = dimensions
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .unwrap_or((16, 10));
+    let scale = (max_width / width as f32).min(APPSHOT_IMAGE_MAX_HEIGHT / height as f32);
+    (width as f32 * scale, height as f32 * scale)
+}
+
+pub fn appshot_strip_height(count: usize) -> f32 {
+    if count == 0 {
+        0.0
+    } else {
+        STRIP_PAD_TOP + APPSHOT_TILE_HEIGHT
     }
 }
 
@@ -3649,6 +3737,14 @@ impl gpui::Element for ComposerTextElement {
 impl Render for ComposerInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
+        let popup_theme = theme.for_popup();
+        let theme = if self.key_context == "PaletteSearch"
+            || self.accessibility_role == gpui::Role::SearchInput
+        {
+            &popup_theme
+        } else {
+            theme
+        };
         let text_color = if self.content.is_empty() {
             theme.text_faint
         } else {
@@ -3762,12 +3858,22 @@ pub enum ComposerEvent {
     AnnotationsCleared {
         chat_id: String,
     },
+    /// Arm the shared-element transition before the draft route is replaced
+    /// by the newly-created session. Emitting this before `select_chat` keeps
+    /// the first destination frame on the same timeline as the source frame.
+    NewThreadTransitionStarted,
     /// A prompt was sent optimistically — give the transcript its exact row
     /// identity so it can anchor the prompt at the top with the reply's
     /// reserved space below it.
-    Sent {
+    Sent { chat_id: String, message_id: String },
+    /// A new worktree's host-side setup attempt completed after its chat id
+    /// was minted. The shell attaches an already-open terminal to that exact
+    /// chat, even when the user has selected another chat in the meantime.
+    WorktreeSetup {
         chat_id: String,
-        message_id: String,
+        setup_action: Option<zeron_proto::ProjectActionRun>,
+        setup_error: Option<String>,
+        target_device_id: Option<String>,
     },
     /// A locally-authored queue row was accepted. It is not a transcript send
     /// yet: the transcript remembers the stable id and promotes it to an
@@ -3815,11 +3921,6 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
         range: at..end,
         query: text[at + 1..cursor].to_string(),
     })
-}
-
-/// Restart a popup's row stack at the top (fresh open / query / result set).
-fn reset_scroll_offset(scroll: &gpui::ScrollHandle) {
-    scroll.set_offset(gpui::Point::new(px(0.0), px(0.0)));
 }
 
 /// The `/` must open the input: slash commands are whole-prompt prefixes
@@ -3916,16 +4017,20 @@ pub struct Composer {
     pub(crate) state: Entity<AppState>,
     pub(crate) input: Entity<ComposerInput>,
     /// Draft displaced while a queued message occupies the composer.
-    pub(crate) queue_edit_draft: Option<(String, Vec<StagedAttachment>)>,
-    /// Composer actions row: repo/branch/harness-model/traits (§1.7).
-    /// Shared with the shell's new-session canvas, which renders the
-    /// device/project target selectors ([`Pickers::render_target_selectors`]).
+    pub(crate) queue_edit_draft: Option<(String, Vec<StagedAttachment>, Vec<CapturedAppshot>)>,
+    /// Composer actions row plus the new-session floating target tab
+    /// ([`Pickers::render_new_thread_target_selectors`]).
     pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     pub(crate) attachments: HashMap<String, Vec<StagedAttachment>>,
+    /// Rich window captures keyed exactly like drafts and ordinary staged
+    /// attachments. Each owns one screenshot that joins the existing upload
+    /// path only at send time.
+    pub(crate) appshots: HashMap<String, Vec<CapturedAppshot>>,
+    appshot_entrances: HashMap<String, Instant>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it; the input
@@ -3953,6 +4058,10 @@ pub struct Composer {
     popup_bar: crate::popover::MenuScrollbarState,
     pub(crate) current_key: String,
     sending: bool,
+    /// Armed immediately before a blank-canvas send selects its minted chat.
+    /// The state observer consumes it to distinguish that handoff from normal
+    /// session navigation, which must continue to snap.
+    launching_new_chat: bool,
     pub(crate) failure: Option<SharedString>,
     /// The chat key `failure` belongs to (`None` = global, e.g. "Engine not
     /// connected"). Chat-scoped failures survive navigation and render only
@@ -3985,6 +4094,8 @@ pub struct Composer {
     /// Live drag over the queue panel: which row, and where it would land.
     pub(crate) queue_drag: Option<crate::queue::QueueDragState>,
     pub(crate) queue_scroll: gpui::ScrollHandle,
+    pub(crate) queue_full_preview: Option<Task<()>>,
+    pub(crate) queue_previews: HashMap<(String, String), crate::queue::QueuePreview>,
     /// Rows awaiting a host-authoritative removal acknowledgement. They stay
     /// visible but inert until the host wins the race against queue delivery.
     pub(crate) queue_removing: HashSet<String>,
@@ -4029,6 +4140,15 @@ pub struct Composer {
     /// Pill height actually rendered last frame — a committed flip morphs
     /// from here, so mid-flight reversals hand off without a jump.
     last_rendered_height: f32,
+    model_handoff_position: f32,
+    model_handoff_from: f32,
+    model_handoff_morph: Option<FlipMorph>,
+    model_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    dock_frame: Option<crate::composer_dock::DockFrame>,
+    /// The shared clock owns this frame's height, including its final step.
+    dock_height_changed: bool,
+    dock_clearance_correction: f32,
+    surface_bounds: crate::new_thread_background_mask::SurfaceBounds,
     last_target_height: f32,
     height_morph: Option<FlipMorph>,
     /// Monotonic clock anchor for the morph timeline.
@@ -4045,6 +4165,33 @@ pub struct Composer {
 impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
+    pub(crate) fn set_dock_frame(
+        &mut self,
+        frame: crate::composer_dock::DockFrame,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.dock_frame != Some(frame);
+        self.dock_height_changed |= self
+            .dock_frame
+            .is_none_or(|previous| previous.amount != frame.amount);
+        self.dock_frame = Some(frame);
+        if frame.active {
+            self.flip_morph = None;
+            self.height_morph = None;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn dock_clearance_correction(&self) -> f32 {
+        self.dock_clearance_correction
+    }
+
+    pub(crate) fn surface_bounds(&self) -> crate::new_thread_background_mask::SurfaceBounds {
+        self.surface_bounds.clone()
+    }
+
     /// The picker entity, for the shell's canvas target selectors.
     pub fn pickers(&self) -> &Entity<Pickers> {
         &self.pickers
@@ -4072,6 +4219,8 @@ impl Composer {
     }
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        cx.on_release(|this, cx| this.release_queue_previews(cx))
+            .detach();
         let input = cx.new(|cx| {
             let mut input =
                 ComposerInput::with_context("Do anything…", MESSAGE_COMPOSER_CONTEXT, cx);
@@ -4139,6 +4288,8 @@ impl Composer {
             pickers,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
+            appshots: HashMap::new(),
+            appshot_entrances: HashMap::new(),
             preview: None,
             preview_focus: cx.focus_handle(),
             preview_focus_pending: false,
@@ -4153,6 +4304,7 @@ impl Composer {
             popup_bar: crate::popover::MenuScrollbarState::default(),
             current_key,
             sending: false,
+            launching_new_chat: false,
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
@@ -4176,6 +4328,8 @@ impl Composer {
             focus_pending: true,
             queue_drag: None,
             queue_scroll: gpui::ScrollHandle::new(),
+            queue_full_preview: None,
+            queue_previews: HashMap::new(),
             queue_removing: HashSet::new(),
             queue_shortcut_revealed: false,
             expanded_mode: false,
@@ -4188,6 +4342,14 @@ impl Composer {
             settle_task: None,
             flip_morph: None,
             last_rendered_height: 0.0,
+            model_handoff_position: 1.0,
+            model_handoff_from: 1.0,
+            model_handoff_morph: None,
+            model_bounds: Default::default(),
+            dock_frame: None,
+            dock_height_changed: false,
+            dock_clearance_correction: 0.0,
+            surface_bounds: Default::default(),
             last_target_height: 0.0,
             height_morph: None,
             morph_clock: Instant::now(),
@@ -4217,10 +4379,10 @@ impl Composer {
             if std::env::var("ZERON_ATTACH_PREVIEW").is_ok_and(|v| v == "1")
                 && let Some(first) = staged.first()
             {
-                composer.preview = Some(attachments::PreviewImage {
-                    name: first.name.clone().into(),
-                    image: first.image.clone(),
-                });
+                composer.preview = Some(attachments::PreviewImage::new(
+                    first.name.clone(),
+                    first.image.clone(),
+                ));
                 composer.preview_focus_pending = true;
             }
             if !staged.is_empty() {
@@ -4257,6 +4419,100 @@ impl Composer {
             .get(&self.current_key)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    pub(crate) fn queue_preview_limit(&self) -> usize {
+        if self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH) < 520.0 {
+            1
+        } else {
+            2
+        }
+    }
+
+    pub(crate) fn show_queue_image(
+        &mut self,
+        preview: attachments::PreviewImage,
+        cx: &mut Context<Self>,
+    ) {
+        self.preview = Some(preview);
+        self.preview_focus_pending = true;
+        cx.notify();
+    }
+
+    pub(crate) fn staged_appshots(&self) -> &[CapturedAppshot] {
+        self.appshots
+            .get(&self.current_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn stage_appshot(&mut self, appshot: CapturedAppshot, cx: &mut Context<Self>) {
+        self.stage_appshot_for(self.current_key.clone(), appshot, cx);
+    }
+
+    pub fn stage_appshot_for(
+        &mut self,
+        key: String,
+        appshot: CapturedAppshot,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let staged_bytes = self
+            .appshots
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .map(|shot| shot.screenshot.bytes().len() as u64)
+            .sum::<u64>();
+        let saved_bytes = self
+            .queue_edit_draft
+            .as_ref()
+            .filter(|_| key == self.current_key)
+            .map(|(_, _, shots)| {
+                shots
+                    .iter()
+                    .map(|shot| shot.screenshot.bytes().len() as u64)
+                    .sum::<u64>()
+            })
+            .unwrap_or_default();
+        let staged_bytes = staged_bytes.saturating_add(saved_bytes);
+        let incoming = appshot.screenshot.bytes().len() as u64;
+        if incoming > attachments::MAX_ATTACHMENT_BYTES
+            || staged_bytes.saturating_add(incoming) > appshots::MAX_STAGED_APPSHOT_BYTES
+        {
+            self.failure = Some(
+                "Remove an Appshot before adding another (96 MB staged Appshot limit).".into(),
+            );
+            self.failure_key = Some(key);
+            cx.notify();
+            return false;
+        }
+        self.appshot_entrances
+            .retain(|_, start| start.elapsed().as_secs_f32() < motion::speed_scale());
+        if !motion::reduced_motion(cx) {
+            self.appshot_entrances
+                .insert(appshot.id.clone(), Instant::now());
+        }
+        // A capture completing while a queue edit is being saved belongs to
+        // the displaced draft; it must not be lost or change the in-flight edit.
+        if self.queue_edit_finishing && key == self.current_key {
+            if let Some((_, _, saved_appshots)) = &mut self.queue_edit_draft {
+                saved_appshots.push(appshot);
+            } else {
+                self.appshots.entry(key).or_default().push(appshot);
+            }
+        } else {
+            self.appshots.entry(key).or_default().push(appshot);
+        }
+        self.failure = None;
+        self.failure_key = None;
+        cx.notify();
+        true
+    }
+
+    pub fn show_appshot_error(&mut self, message: String, cx: &mut Context<Self>) {
+        self.failure = Some(message.into());
+        self.failure_key = Some(self.current_key.clone());
+        cx.notify();
     }
 
     fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
@@ -4330,10 +4586,44 @@ impl Composer {
         cx.notify();
     }
 
+    fn restore_failed_appshots(
+        &mut self,
+        sent: &[CapturedAppshot],
+        failed_key: &str,
+        restore_key: &str,
+    ) {
+        if sent.is_empty() {
+            return;
+        }
+        let mut merged = sent.to_vec();
+        for key in [failed_key, restore_key] {
+            for shot in self.appshots.remove(key).unwrap_or_default() {
+                if !merged.iter().any(|existing| existing.id == shot.id) {
+                    merged.push(shot);
+                }
+            }
+        }
+        self.appshots.insert(restore_key.to_string(), merged);
+    }
+
+    fn remove_appshot(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.queue_edit_finishing {
+            return;
+        }
+        if let Some(list) = self.appshots.get_mut(&self.current_key) {
+            list.retain(|appshot| appshot.id != id);
+            if list.is_empty() {
+                self.appshots.remove(&self.current_key);
+            }
+        }
+        cx.notify();
+    }
+
     /// Drop a deleted chat's per-chat composer state — staged attachments hold
     /// raw image bytes, and a deleted chat's stage could never be sent again.
     pub fn purge_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.attachments.remove(chat_id);
+        self.appshots.remove(chat_id);
         self.state.update(cx, |state, _| {
             state.purge_review_comments(chat_id);
             state.purge_transcript_annotations(chat_id);
@@ -4405,10 +4695,7 @@ impl Composer {
             .pt(px(STRIP_PAD_TOP));
         for (ix, att) in staged.iter().enumerate() {
             let group: SharedString = format!("composer-att-{}", att.id).into();
-            let preview = attachments::PreviewImage {
-                name: att.name.clone().into(),
-                image: att.image.clone(),
-            };
+            let preview = attachments::PreviewImage::new(att.name.clone(), att.image.clone());
             let remove_id = att.id.clone();
             strip = strip.child(
                 div()
@@ -4425,6 +4712,7 @@ impl Composer {
                             .border_color(crate::theme::hairline(0.10))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                preview.viewer.reset();
                                 this.preview = Some(preview.clone());
                                 this.preview_focus_pending = true;
                                 cx.notify();
@@ -4499,6 +4787,235 @@ impl Composer {
             ));
         }
         Some(strip)
+    }
+
+    fn render_appshot_strip(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let appshots = self.staged_appshots();
+        if appshots.is_empty() {
+            return None;
+        }
+        let mut strip = div()
+            .id("composer-appshots-strip")
+            .flex()
+            .flex_row()
+            .gap(px(STRIP_GAP))
+            .px(px(STRIP_PAD_X))
+            .pt(px(STRIP_PAD_TOP))
+            .overflow_x_scroll();
+        let max_image_width = self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH)
+            - 2.0 * Theme::SPACE_LG
+            - 2.0
+            - 2.0 * STRIP_PAD_X
+            - 2.0 * APPSHOT_IMAGE_INSET;
+        for (ix, appshot) in appshots.iter().enumerate() {
+            let group: SharedString = format!("composer-appshot-{}", appshot.id).into();
+            let preview = crate::attachments::PreviewImage::new(
+                appshot.screenshot.name.clone(),
+                appshot.screenshot.image.clone(),
+            );
+            let preview_on_key = preview.clone();
+            let preview_on_a11y = preview.clone();
+            let composer_for_preview = cx.entity().downgrade();
+            let remove_id = appshot.id.clone();
+            let remove_on_key_id = remove_id.clone();
+            let remove_on_a11y_id = remove_id.clone();
+            let composer_for_remove = cx.entity().downgrade();
+            let source: SharedString = appshot
+                .window_title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| appshot.app_name.clone())
+                .into();
+            let preview_label: SharedString = format!("Preview {source}").into();
+            let remove_label: SharedString = format!("Remove {source}").into();
+            let preview_aria = preview_label.clone();
+            let remove_aria = remove_label.clone();
+            let (image_width, image_height) =
+                appshot_contained_size(appshot.screenshot_dimensions, max_image_width);
+            let tile_width = (image_width + 2.0 * APPSHOT_IMAGE_INSET).max(APPSHOT_TILE_MIN_WIDTH);
+            let mut card = div()
+                .id(("composer-appshot", ix))
+                .group(group.clone())
+                .relative()
+                .w(px(tile_width))
+                .h(px(APPSHOT_TILE_HEIGHT))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .items_center()
+                .rounded(px(14.0))
+                .overflow_hidden()
+                .cursor_pointer()
+                .hover(|style| style.bg(crate::theme::ink(0.045)))
+                .tooltip(move |_, cx| {
+                    cx.new(|_| AppshotActionTooltip(preview_label.clone()))
+                        .into()
+                })
+                .role(gpui::Role::Button)
+                .aria_label(preview_aria)
+                .tab_index(0)
+                .focus_visible(|style| {
+                    style
+                        .bg(crate::theme::ink(0.06))
+                        .border_1()
+                        .border_color(theme.accent)
+                })
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                    if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                        cx.stop_propagation();
+                        preview_on_key.viewer.reset();
+                        this.preview = Some(preview_on_key.clone());
+                        this.preview_focus_pending = true;
+                        cx.notify();
+                    }
+                }))
+                .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                    composer_for_preview
+                        .update(cx, |this, cx| {
+                            preview_on_a11y.viewer.reset();
+                            this.preview = Some(preview_on_a11y.clone());
+                            this.preview_focus_pending = true;
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    preview.viewer.reset();
+                    this.preview = Some(preview.clone());
+                    this.preview_focus_pending = true;
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id(("composer-appshot-preview", ix))
+                        .w(px(tile_width))
+                        .h(px(APPSHOT_PREVIEW_HEIGHT))
+                        .relative()
+                        .flex_none()
+                        .flex()
+                        .items_end()
+                        .justify_center()
+                        .overflow_hidden()
+                        .rounded(px(12.0))
+                        .child(
+                            div()
+                                .w(px(image_width))
+                                .h(px(image_height))
+                                .flex_none()
+                                .overflow_hidden()
+                                .rounded(px(4.0))
+                                .shadow_sm()
+                                .child(crate::edge_fade::edge_faded(
+                                    44.0,
+                                    false,
+                                    true,
+                                    img(appshot.screenshot.image.clone())
+                                        .w(px(image_width))
+                                        .h(px(image_height))
+                                        .object_fit(ObjectFit::Contain),
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .mt(px(20.0))
+                        .max_w(px(tile_width - 20.0))
+                        .truncate()
+                        .text_center()
+                        .text_size(px(12.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(source),
+                );
+            if let Some(icon) = &appshot.app_icon {
+                card = card.child(crate::frost::layered(
+                    div()
+                        .absolute()
+                        .top(px(APPSHOT_PREVIEW_HEIGHT - 22.0))
+                        .left(px((tile_width - 28.0) / 2.0))
+                        .size(px(28.0))
+                        .rounded(px(7.0))
+                        .bg(theme.bg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            img(icon.clone())
+                                .size(px(24.0))
+                                .rounded(px(5.0))
+                                .object_fit(ObjectFit::Contain),
+                        ),
+                ));
+            }
+            card = card.child(crate::frost::layered(
+                div()
+                    .id(("composer-appshot-remove", ix))
+                    .absolute()
+                    .top(px(6.0))
+                    .right(px(6.0))
+                    .size(px(22.0))
+                    .rounded_full()
+                    .bg(theme.bg.opacity(0.92))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .shadow_sm()
+                    .opacity(0.0)
+                    .group_hover(group, |style| style.opacity(1.0))
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| AppshotActionTooltip(remove_label.clone()))
+                            .into()
+                    })
+                    .role(gpui::Role::Button)
+                    .aria_label(remove_aria)
+                    .tab_index(0)
+                    .focus_visible(|style| style.opacity(1.0).border_1().border_color(theme.accent))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            cx.stop_propagation();
+                            this.remove_appshot(&remove_on_key_id, cx);
+                        }
+                    }))
+                    .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                        composer_for_remove
+                            .update(cx, |this, cx| {
+                                this.remove_appshot(&remove_on_a11y_id, cx);
+                            })
+                            .ok();
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.remove_appshot(&remove_id, cx);
+                    }))
+                    .child(
+                        crate::icons::icon(crate::icons::CLOSE_CIRCLE)
+                            .size(px(15.0))
+                            .text_color(theme.text_muted),
+                    ),
+            ));
+            // Entity-owned timestamps prevent the entrance replaying on route remount.
+            if let Some(start) = self.appshot_entrances.get(&appshot.id) {
+                let raw = (start.elapsed().as_secs_f32() / (0.24 * motion::speed_scale()))
+                    .clamp(0.0, 1.0);
+                if raw < 1.0 && !motion::reduced_motion(cx) {
+                    let progress =
+                        motion::MotionSpec::new(240, motion::EASE_OUT_EXPO).progress(raw);
+                    card = card.opacity(progress).top(px(8.0 * (1.0 - progress)));
+                    window.request_animation_frame();
+                }
+            }
+            strip = strip.child(card);
+        }
+        Some(strip.into_any_element())
     }
 
     /// Paperclip: the native image picker (the original's hidden
@@ -4598,7 +5115,7 @@ impl Composer {
             self.mention.results.clear();
             self.mention.active = None;
             // Fresh open: the row stack restarts at the top.
-            reset_scroll_offset(&self.mention_scroll);
+            crate::popover::reset_menu_scroll(&self.mention_scroll, &mut self.popup_bar);
         }
         self.mention.error = None;
         self.mention.loading = token.is_some();
@@ -4675,7 +5192,10 @@ impl Composer {
                             composer.mention.active = (!results.is_empty()).then_some(0);
                             composer.mention.results = results;
                             // New result set: the row stack restarts at the top.
-                            reset_scroll_offset(&composer.mention_scroll);
+                            crate::popover::reset_menu_scroll(
+                                &composer.mention_scroll,
+                                &mut composer.popup_bar,
+                            );
                         }
                         Err(err) => tracing::warn!(%err, "file mention response decode failed"),
                     },
@@ -4737,10 +5257,11 @@ impl Composer {
     }
 
     fn render_file_mention_popup(
-        &self,
+        &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
+        let theme = &theme.for_popup();
         let token = self.mention.token.as_ref()?;
         let mut card = crate::popover::popover_card(theme)
             .w_full()
@@ -4754,9 +5275,6 @@ impl Composer {
                     window.focus(&this.input.focus_handle(cx), cx);
                 }),
             )
-            // GPUI dispatches this captured stream while the thumb is
-            // dragged, including when the pointer has left the popup.
-            .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         if self.mention.loading && self.mention.results.is_empty() {
             card = card.child(crate::popover::skeleton_rows(
@@ -4811,14 +5329,19 @@ impl Composer {
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
-                                    crate::icons::icon(if result.is_dir {
-                                        crate::icons::FOLDER
-                                    } else {
-                                        crate::icons::DOCUMENT
-                                    })
+                                    crate::file_icons::icon(
+                                        if result.is_dir {
+                                            crate::file_icons::FileIconIdentity::directory(
+                                                &result.path,
+                                                false,
+                                            )
+                                        } else {
+                                            crate::file_icons::FileIconIdentity::file(&result.path)
+                                        },
+                                        theme.appearance,
+                                    )
                                     .size(px(14.0))
-                                    .flex_none()
-                                    .text_color(theme.text_muted),
+                                    .flex_none(),
                                 )
                                 .child(
                                     div()
@@ -4856,16 +5379,12 @@ impl Composer {
                             .max_h(px(312.0))
                             .flex()
                             .flex_col()
+                            .gap(px(crate::popover::MENU_GAP))
                             .overflow_y_scroll()
                             .track_scroll(&self.mention_scroll)
                             .children(rows),
                     )
-                    .children(self.popup_scrollbar(
-                        "mention-scrollbar",
-                        &self.mention_scroll,
-                        theme,
-                        cx,
-                    )),
+                    .children(crate::popover::rail(self, "mention-scrollbar", theme, cx)),
             );
         }
         Some(crate::popover::full_width_menu_above(
@@ -4986,7 +5505,7 @@ impl Composer {
         self.slash.filtered = crate::popover::filter_indices(&query, &names);
         self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
         // A fresh query/reopen restarts the row stack at the top.
-        reset_scroll_offset(&self.slash_scroll);
+        crate::popover::reset_menu_scroll(&self.slash_scroll, &mut self.popup_bar);
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -5053,10 +5572,11 @@ impl Composer {
     }
 
     fn render_slash_popup(
-        &self,
+        &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
+        let theme = &theme.for_popup();
         // Only while a slash token is active.
         self.slash.token.as_ref()?;
         let commands = self
@@ -5077,9 +5597,6 @@ impl Composer {
                     window.focus(&this.input.focus_handle(cx), cx);
                 }),
             )
-            // GPUI dispatches this captured stream while the thumb is
-            // dragged, including when the pointer has left the popup.
-            .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_slash(cx)));
         if self.slash.loading && commands.is_empty() {
             card = card.child(crate::popover::skeleton_rows(
@@ -5181,16 +5698,12 @@ impl Composer {
                             .max_h(px(312.0))
                             .flex()
                             .flex_col()
+                            .gap(px(crate::popover::MENU_GAP))
                             .overflow_y_scroll()
                             .track_scroll(&self.slash_scroll)
                             .children(rows),
                     )
-                    .children(self.popup_scrollbar(
-                        "slash-scrollbar",
-                        &self.slash_scroll,
-                        theme,
-                        cx,
-                    )),
+                    .children(crate::popover::rail(self, "slash-scrollbar", theme, cx)),
             );
         }
         // Full pill width above the composer, matching the file-mention popup.
@@ -5199,42 +5712,6 @@ impl Composer {
             card.into_any_element(),
             None,
         ))
-    }
-
-    /// The floating scrollbar rail for a composer popup's scroll host (the
-    /// model-list treatment). Callers pass the id and that popup's scroll
-    /// handle; the hover/drag interaction state is shared.
-    fn popup_scrollbar(
-        &self,
-        id: &'static str,
-        scroll: &gpui::ScrollHandle,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let metrics = self.popup_bar.metrics(scroll)?;
-        Some(
-            self.popup_bar
-                .render_rail(theme, metrics)?
-                .id(id)
-                .on_hover(cx.listener(Self::on_popup_bar_hover))
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(Self::on_popup_bar_mouse_down),
-                )
-                .on_drag(crate::popover::MenuScrollbarDrag, |_, _, _, cx| {
-                    cx.stop_propagation();
-                    cx.new(|_| crate::popover::MenuScrollbarDragGhost)
-                })
-                .on_mouse_up_out(
-                    gpui::MouseButton::Left,
-                    cx.listener(Self::on_popup_bar_mouse_up),
-                )
-                .on_mouse_up(
-                    gpui::MouseButton::Left,
-                    cx.listener(Self::on_popup_bar_mouse_up),
-                )
-                .into_any_element(),
-        )
     }
 
     /// The popup whose rows a scrollbar drag is moving — the tokens are
@@ -5258,52 +5735,6 @@ impl Composer {
         if self.popup_bar.set_list_hovered(*hovered) {
             cx.notify();
         }
-    }
-
-    fn on_popup_bar_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.popup_bar.set_bar_hovered(*hovered) {
-            cx.notify();
-        }
-    }
-
-    fn on_popup_bar_mouse_down(
-        &mut self,
-        event: &gpui::MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(scroll) = self.active_popup_scroll() else {
-            return;
-        };
-        if !self.popup_bar.begin_press(&scroll, event.position.y) {
-            return;
-        }
-        cx.stop_propagation();
-        cx.notify();
-    }
-
-    fn on_popup_bar_drag_move(
-        &mut self,
-        event: &gpui::DragMoveEvent<crate::popover::MenuScrollbarDrag>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(scroll) = self.active_popup_scroll() else {
-            return;
-        };
-        if self.popup_bar.drag_to(&scroll, event.event.position.y) {
-            cx.notify();
-        }
-    }
-
-    fn on_popup_bar_mouse_up(
-        &mut self,
-        _event: &gpui::MouseUpEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.popup_bar.end_press();
-        cx.notify();
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
@@ -5344,7 +5775,9 @@ impl Composer {
             self.failure =
                 Some("The queued message was removed; your edit remains in the composer".into());
             // Recover both drafts when another device removes the reserved row.
-            if let Some((draft, mut attachments)) = self.queue_edit_draft.take() {
+            if let Some((draft, mut attachments, mut appshots)) = self.queue_edit_draft.take() {
+                appshots.extend(self.appshots.remove(&self.current_key).unwrap_or_default());
+                self.appshots.insert(self.current_key.clone(), appshots);
                 let edited = self.input.read(cx).text().to_string();
                 let text = [draft, edited]
                     .into_iter()
@@ -5365,6 +5798,10 @@ impl Composer {
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
+            let new_thread_launch =
+                self.launching_new_chat && self.current_key.is_empty() && !key.is_empty();
+            let returning_to_new_thread = !self.current_key.is_empty() && key.is_empty();
+            self.launching_new_chat = false;
             let old_text = self.input.read(cx).text().to_string();
             if old_text.is_empty() {
                 self.drafts.remove(&self.current_key);
@@ -5388,11 +5825,27 @@ impl Composer {
             // the nav-driven flip only commits AFTER the swapped draft has
             // been re-measured, one or two renders later, so the whole
             // window snaps (see ROUTE_SNAP_MS).
-            self.flip_morph = None;
             self.height_morph = None;
             self.last_target_height = 0.0;
-            self.last_rendered_height = 0.0;
-            self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
+            if (new_thread_launch || returning_to_new_thread)
+                && !motion::reduced_motion(cx)
+                && self.last_rendered_height > 0.0
+            {
+                // Both directions share one timeline. The blank canvas is
+                // always expanded; an established session begins compact.
+                self.expanded_mode = returning_to_new_thread;
+                let now_ms =
+                    self.morph_clock.elapsed().as_secs_f32() * 1000.0 / motion::speed_scale();
+                self.flip_morph = Some(FlipMorph::new_thread_transition(
+                    self.last_rendered_height,
+                    now_ms,
+                ));
+                self.route_snap_until = None;
+            } else {
+                self.flip_morph = None;
+                self.last_rendered_height = 0.0;
+                self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
+            }
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
         }
 
@@ -5485,7 +5938,7 @@ impl Composer {
         }
         let has_text = composer_has_content(
             self.input.read(cx).text(),
-            self.staged().len(),
+            self.staged().len() + self.staged_appshots().len(),
             self.extra_count(cx),
         );
         send_button_mode(self.run_live(cx), has_text)
@@ -5505,9 +5958,18 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).text().trim().to_string();
-        let no_content = !composer_has_content(&text, self.staged().len(), self.extra_count(cx));
+        let no_content = !composer_has_content(
+            &text,
+            self.staged().len() + self.staged_appshots().len(),
+            self.extra_count(cx),
+        );
         match self.button_mode(cx) {
-            SendButtonMode::Stop => self.interrupt_selected(cx),
+            // Enter never stops a run: Stop mode implies an empty composer,
+            // so a stray extra Enter right after sending landed an interrupt
+            // on the just-dispatched prompt and the agent ate it silently
+            // (issue #406). Stop stays on the button — and on Esc when
+            // escape_stops_active_agent is enabled.
+            SendButtonMode::Stop => {}
             _ if no_content => {}
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Send => self.send(text, false, cx),
@@ -5517,20 +5979,20 @@ impl Composer {
     }
 
     /// Cmd/Ctrl+Enter remains an ordinary submit while the composer carries
-    /// content. With a truly empty composer it instead advances the queue's
-    /// first actionable row, and never turns an empty chord into Stop.
+    /// content. With a truly empty composer it instead activates the most
+    /// recently queued row, and never turns an empty chord into Stop.
     fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
         if self.commit_queue_edit(cx) {
             return;
         }
         let has_content = composer_has_content(
             self.input.read(cx).text(),
-            self.staged().len(),
+            self.staged().len() + self.staged_appshots().len(),
             self.extra_count(cx),
         );
         match modified_submit_target(has_content) {
             ModifiedSubmitTarget::SubmitContent => self.on_submit(cx),
-            ModifiedSubmitTarget::ActivateQueueHead => self.queue_pop_head(cx),
+            ModifiedSubmitTarget::ActivateLatestQueued => self.activate_latest_queued(cx),
         }
     }
 
@@ -5598,7 +6060,7 @@ impl Composer {
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
         if queue && !is_new {
-            let capability = if self.staged().is_empty() {
+            let capability = if self.staged().is_empty() && self.staged_appshots().is_empty() {
                 capabilities::MESSAGE_QUEUE_V1
             } else {
                 capabilities::MESSAGE_QUEUE_ATTACHMENTS_V1
@@ -5615,10 +6077,17 @@ impl Composer {
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
         // back into the chat's stash.
-        let staged = self
+        let ordinary_staged = self
             .attachments
             .remove(&self.current_key)
             .unwrap_or_default();
+        let staged_appshots = self.appshots.remove(&self.current_key).unwrap_or_default();
+        let mut staged = ordinary_staged.clone();
+        staged.extend(
+            staged_appshots
+                .iter()
+                .map(|appshot| appshot.screenshot.clone()),
+        );
         // `typed` keeps the user's own words for the failure hand-back below:
         // restoring the folded prompt would paste the comment block into the
         // input as literal text.
@@ -5674,7 +6143,10 @@ impl Composer {
             .is_some_and(|id| local_device_id.as_deref() != Some(id));
         // Queue rows do not carry upstream's attachment-transfer escort, so
         // they retain the proven host-upload path and store absolute refs.
-        let queued_flow = !queue && !staged.is_empty() && {
+        // Appshot XML attributes require escaped final paths. The engine's plain
+        // string replacement of pending refs cannot safely rewrite those, so
+        // rich captures use the existing upload-before-send path.
+        let queued_flow = !queue && staged_appshots.is_empty() && !staged.is_empty() && {
             let state = self.state.read(cx);
             let local_ok = local_device_id
                 .as_deref()
@@ -5711,7 +6183,15 @@ impl Composer {
                 .map(|att| format!("pending/{}/{}", att.id, att.name))
                 .collect()
         };
-        let echo_text = attachments::with_attachments(&text, &echo_paths);
+        let echo_appshot_paths: HashMap<String, String> = staged
+            .iter()
+            .zip(&echo_paths)
+            .map(|(attachment, path)| (attachment.id.clone(), path.clone()))
+            .collect();
+        let echo_text = attachments::with_attachments(
+            &appshots::with_appshots(&text, &staged_appshots, &echo_appshot_paths),
+            &echo_paths,
+        );
         // Queued flow also seeds the UPLOAD ALIAS: the host rewrites the
         // persisted ref to `{its uploads dir}/{id8}-{name}` — an absolute
         // path the sender can't predict, but whose id8 it minted. The alias
@@ -5760,6 +6240,10 @@ impl Composer {
             status: None,
             continuation_of: None,
         };
+        self.launching_new_chat = is_new;
+        if is_new {
+            cx.emit(ComposerEvent::NewThreadTransitionStarted);
+        }
         // A queued message is not in the transcript yet — the queue panel is
         // its echo, and it gets a real bubble when the host sends it.
         self.state.update(cx, |s, cx| {
@@ -5895,7 +6379,15 @@ impl Composer {
                             attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
                         }
                     }
-                    content = attachments::with_attachments(&text, &attachment_paths);
+                    let appshot_paths: HashMap<String, String> = staged
+                        .iter()
+                        .zip(&attachment_paths)
+                        .map(|(attachment, path)| (attachment.id.clone(), path.clone()))
+                        .collect();
+                    content = attachments::with_attachments(
+                        &appshots::with_appshots(&text, &staged_appshots, &appshot_paths),
+                        &attachment_paths,
+                    );
                     // A normal send already has an optimistic echo: refresh it
                     // in place with the uploaded refs so its thumbnails never
                     // flicker. A queued message has no transcript echo at all;
@@ -5981,7 +6473,8 @@ impl Composer {
                                     base.clone().unwrap_or_else(|| "HEAD".to_string());
                                 run_worktree = Some(zeron_proto::WorktreeSpec {
                                     repo_path: repo_path.clone(),
-                                    base: base.clone(),
+                                    base,
+                                    space_id: space_id.clone(),
                                 });
                             }
                         }
@@ -6050,12 +6543,15 @@ impl Composer {
                     // A queue row is editable UI state, so its text must stay
                     // free of the internal attachment-path trailer. The host
                     // rebuilds that transport when it promotes the row.
+                    let appshot_paths = staged.iter().zip(&attachment_paths)
+                        .map(|(attachment, path)| (attachment.id.clone(), path.clone())).collect();
+                    let queue_body = appshots::with_appshots(&text, &staged_appshots, &appshot_paths);
                     let queue_text = if !clean_queue_attachment_text {
                         content.as_str()
-                    } else if text.trim().is_empty() && !attachment_paths.is_empty() {
+                    } else if queue_body.trim().is_empty() && !attachment_paths.is_empty() {
                         attachments::ATTACHMENT_ONLY_TEXT
                     } else {
-                        text.as_str()
+                        queue_body.as_str()
                     };
                     let params = serde_json::json!({
                         "chatId": chat_id,
@@ -6076,6 +6572,10 @@ impl Composer {
                     return Ok(Some(queue_id.to_string()));
                 }
 
+                let expects_setup_handoff = run_worktree
+                    .as_ref()
+                    .and_then(|spec| spec.space_id.as_ref())
+                    .is_some();
                 let command = SessionCommandPayload::Run {
                     request: RunRequest {
                         prompt: content.clone(),
@@ -6099,9 +6599,8 @@ impl Composer {
                     params["transfers"] = serde_json::Value::Array(transfers);
                 }
                 // Deadline-bounded: QueueCommand is a local write (in-process
-                // or IPC), but a deferred engine handle can park forever —
-                // the send task must never grind silently (2026-08-19).
-                attachments::call_with_timeout(
+                // or IPC), but a deferred engine handle can park forever.
+                let queued = attachments::call_with_timeout(
                     &engine,
                     cx.background_executor(),
                     methods::QUEUE_COMMAND,
@@ -6110,6 +6609,77 @@ impl Composer {
                 )
                 .await
                 .map_err(|e| format!("Send failed: {e}"))?;
+                if expects_setup_handoff
+                    && let Some(command_id) = queued
+                        .get("commandId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                {
+                    let poll_engine = engine.clone();
+                    let poll_chat_id = chat_id.clone();
+                    let poll_target_device_id = host_device_id.clone();
+                    this.update(cx, |_, cx| {
+                        cx.spawn(async move |this, cx| {
+                            for _ in 0..480 {
+                                let mut params = serde_json::json!({
+                                    "chatId": poll_chat_id,
+                                    "commandId": command_id,
+                                });
+                                if let (Some(target), Some(object)) =
+                                    (&poll_target_device_id, params.as_object_mut())
+                                {
+                                    object.insert(
+                                        "targetDeviceId".into(),
+                                        serde_json::Value::String(target.clone()),
+                                    );
+                                }
+                                match attachments::call_with_timeout(
+                                    &poll_engine,
+                                    cx.background_executor(),
+                                    methods::TAKE_PROJECT_ACTION_SETUP,
+                                    params,
+                                    std::time::Duration::from_secs(10),
+                                )
+                                .await
+                                {
+                                    Ok(value) if value.get("ready").and_then(|v| v.as_bool()) == Some(true) => {
+                                        let setup_action = value
+                                            .get("setupAction")
+                                            .cloned()
+                                            .filter(|value| !value.is_null())
+                                            .and_then(|value| serde_json::from_value(value).ok());
+                                        let setup_error = value
+                                            .get("setupError")
+                                            .and_then(|value| value.as_str())
+                                            .map(str::to_string);
+                                        this.update(cx, |_, cx| {
+                                            cx.emit(ComposerEvent::WorktreeSetup {
+                                                chat_id: poll_chat_id.clone(),
+                                                setup_action,
+                                                setup_error,
+                                                target_device_id: poll_target_device_id.clone(),
+                                            });
+                                        })
+                                        .ok();
+                                        return;
+                                    }
+                                    Err(error) if error.starts_with("unknown method: ") => return,
+                                    Ok(_) | Err(_) => {}
+                                }
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(250))
+                                    .await;
+                            }
+                            tracing::warn!(
+                                chat = %poll_chat_id,
+                                command = %command_id,
+                                "worktree setup handoff timed out"
+                            );
+                        })
+                        .detach();
+                    })
+                    .ok();
+                }
                 Ok(None)
             }
             .await;
@@ -6182,12 +6752,12 @@ impl Composer {
                         // no further swap will fire). Set the input directly.
                         composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
                     }
-                    if !staged.is_empty() {
+                    if !ordinary_staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
                         // while the send was in flight survive the hand-back —
                         // draining the minted chat's slot too when the restore
                         // target is the canvas.
-                        let mut merged = staged.clone();
+                        let mut merged = ordinary_staged.clone();
                         for key in [err_chat_id.clone(), restore_key.clone()] {
                             if let Some(slot) = composer.attachments.get_mut(&key) {
                                 let fresh: Vec<_> = slot
@@ -6197,8 +6767,9 @@ impl Composer {
                                 merged.extend(fresh);
                             }
                         }
-                        composer.attachments.insert(restore_key, merged);
+                        composer.attachments.insert(restore_key.clone(), merged);
                     }
+                    composer.restore_failed_appshots(&staged_appshots, &err_chat_id, &restore_key);
                 }
                 cx.notify();
             })
@@ -6658,6 +7229,19 @@ impl Composer {
     }
 }
 
+/// The completion popups' floating rails run through
+/// [`crate::popover::rail`]: the shared `popup_bar` state plus whichever
+/// popup's rows are mounted — see [`Composer::active_popup_scroll`].
+impl crate::popover::ScrollRailHost for Composer {
+    fn rail_bar(&mut self) -> &mut crate::popover::MenuScrollbarState {
+        &mut self.popup_bar
+    }
+
+    fn rail_scroll(&self) -> Option<gpui::ScrollHandle> {
+        self.active_popup_scroll()
+    }
+}
+
 /// Focus lands on the prompt input (window-level focus fallbacks — e.g. after
 /// the focused terminal panel is hidden — route here).
 impl Focusable for Composer {
@@ -6792,14 +7376,20 @@ impl Render for Composer {
         let route_snap = self
             .route_snap_until
             .is_some_and(|until| Instant::now() < until);
-        self.flip_morph = flip_morph_step(
-            self.flip_morph,
-            committed_flip && !new_chat,
-            self.last_rendered_height,
-            now_ms,
-            motion::reduced_motion(cx),
-            route_snap,
-        );
+        let dock_height_changed = std::mem::take(&mut self.dock_height_changed);
+        self.flip_morph =
+            if dock_height_changed || self.dock_frame.is_some_and(|frame| frame.active) {
+                None
+            } else {
+                flip_morph_step(
+                    self.flip_morph,
+                    committed_flip && !new_chat,
+                    self.last_rendered_height,
+                    now_ms,
+                    motion::reduced_motion(cx),
+                    route_snap,
+                )
+            };
         let expanded = self.expanded_mode;
 
         // Chat-scoped failures render only under their own chat; a global
@@ -6850,60 +7440,27 @@ impl Render for Composer {
             .px(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
             .when_some(failure, |el, message| {
-                // zeron composer.tsx `Notice` (matches the transcript
-                // ErrorChip palette): `flex items-start gap-2 rounded-xl
-                // border px-3 py-2 text-[12px] leading-snug` with a 14px
-                // DangerTriangle — a subtle tinted wash, not a bare red
-                // stroke. Amber for the offline-ish case (engine not
-                // connected), red for send/run failures. Click dismisses.
+                // Amber with "Warning" for the offline-ish case (engine not
+                // connected), red with "Error" for send/run failures. Click
+                // dismisses.
                 let offline = message.as_ref() == "Engine not connected";
-                let (border_c, wash, text_c) = if offline {
-                    let amber = theme.warning; // amber-400
-                    let amber_200 = theme.warning_muted;
-                    (
-                        amber.opacity(0.16),
-                        amber.opacity(0.05),
-                        amber_200.opacity(0.9),
-                    )
-                } else {
-                    let danger = theme.danger; // red-400
-                    let red_300 = theme.danger_muted;
-                    (
-                        danger.opacity(0.16),
-                        danger.opacity(0.05),
-                        red_300.opacity(0.9),
-                    )
-                };
                 el.child(
-                    div()
-                        .id("composer-failure")
-                        .mx(px(4.0))
-                        .mt(px(6.0))
-                        .flex()
-                        .items_start()
-                        .gap(px(8.0))
-                        .rounded(px(12.0))
-                        .border_1()
-                        .border_color(border_c)
-                        .bg(wash)
-                        .px(px(12.0))
-                        .py(px(8.0))
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .line_height(px(16.0))
-                        .text_color(text_c)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.failure = None;
-                            this.failure_key = None;
-                            cx.notify();
-                        }))
-                        .child(
-                            crate::icons::icon(crate::icons::DANGER_TRIANGLE)
-                                .size(px(14.0))
-                                .mt(px(2.0))
-                                .text_color(text_c),
-                        )
-                        .child(div().min_w_0().child(message)),
+                    notice_chip(
+                        &theme,
+                        offline,
+                        if offline { "Warning" } else { "Error" },
+                        message,
+                        NoticeChipIcon::Plain,
+                    )
+                    .id("composer-failure")
+                    .mx(px(4.0))
+                    .mt(px(6.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.failure = None;
+                        this.failure_key = None;
+                        cx.notify();
+                    })),
                 )
             })
             .when_some(queue_notice, |el, (notice, offline)| {
@@ -6941,16 +7498,16 @@ impl Render for Composer {
         // What is waiting to be sent, stacked directly above the box it was
         // typed in — the queue is a property of this composer, not a panel
         // somewhere else.
-        let show_queue_head_shortcut = self.queue_shortcut_revealed
+        let show_queue_latest_shortcut = self.queue_shortcut_revealed
             && self.editing_queued.is_none()
             && !self.pickers.read(cx).is_open()
             && !composer_has_content(
                 self.input.read(cx).text(),
-                self.staged().len(),
+                self.staged().len() + self.staged_appshots().len(),
                 self.extra_count(cx),
             );
         let container = container.when_some(
-            self.render_queue_panel(show_queue_head_shortcut, window, cx),
+            self.render_queue_panel(show_queue_latest_shortcut, window, cx),
             |el, panel| {
                 el.child(motion::fade_quick(
                     "composer-queue",
@@ -6978,10 +7535,22 @@ impl Render for Composer {
             }))
         });
 
-        // New chats always use the expanded layout: the repo/branch pickers
-        // need the full-width actions row (zeron composer-actions.tsx
-        // `mustExpand = isNew || …`).
+        // Route coordination must not force an established thread into the
+        // two-row layout. Short drafts keep the original skinny composer.
+        let session_expanded = expanded;
         let expanded = expanded || new_chat;
+        let dock_amount = self.dock_frame.map_or(0.0, |frame| frame.amount);
+        let dock_height = |amount: f32| {
+            let hero = composer_total_height(content_height);
+            let session = if session_expanded {
+                (content_height + TEXTAREA_PAD_V).clamp(TEXTAREA_MIN - 16.0, TEXTAREA_MAX)
+                    + ACTIONS_ROW_HEIGHT
+                    + PILL_BORDER_V
+            } else {
+                COMPACT_TOTAL_HEIGHT
+            };
+            motion::lerp(hero, session, amount)
+        };
 
         // Committed-height morph: the layout below is already the NEW mode's;
         // only the pill's height (and the entrance fade/text glide driven by
@@ -6995,6 +7564,7 @@ impl Render for Composer {
         // for the outer container padding and the pill's 1px borders.
         let strip_width_hint =
             self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH) - 2.0 * Theme::SPACE_LG - 2.0;
+        let appshot_count = self.staged_appshots().len();
         let strip_h = if staged_count > 0 {
             attachment_strip_height(staged_count, strip_width_hint)
         } else if annotation_count > 0 {
@@ -7003,20 +7573,53 @@ impl Render for Composer {
             0.0
         };
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
-        let base_height = if expanded {
+        let base_height = if self.dock_frame.is_some() {
+            dock_height(dock_amount)
+        } else if expanded {
             composer_total_height(content_height)
         } else {
             COMPACT_TOTAL_HEIGHT
         };
-        let target_height = base_height + strip_h + comment_strip_h;
-        self.height_morph = flip_morph_step(
-            self.height_morph,
-            (target_height - self.last_target_height).abs() > 0.5,
-            self.last_rendered_height,
-            now_ms,
-            motion::reduced_motion(cx),
-            route_snap,
+        let target_height =
+            base_height + strip_h + appshot_strip_height(appshot_count) + comment_strip_h;
+        let coordinated_route_morph = self
+            .flip_morph
+            .filter(|m| m.spec == motion::NEW_THREAD_TRANSITION && !m.done(now_ms));
+        // The route state commits before its shared-element animation begins.
+        // Reconstruct the departing chrome at t=0, then progressively trade
+        // it for the destination chrome so neither route changes the outer
+        // composer geometry in a single frame.
+        let new_thread_chrome = self
+            .dock_frame
+            .map(|frame| frame.selectors())
+            .unwrap_or_else(|| {
+                coordinated_route_morph.map_or_else(
+                    || if new_chat { 1.0 } else { 0.0 },
+                    |morph| {
+                        let progress = morph.progress(now_ms);
+                        if new_chat { progress } else { 1.0 - progress }
+                    },
+                )
+            });
+        let (new_thread_chrome_opacity, session_chrome_opacity) = self.dock_frame.map_or_else(
+            || route_chrome_opacities(new_thread_chrome),
+            |frame| (frame.selectors(), frame.footer()),
         );
+        self.height_morph =
+            if dock_height_changed || self.dock_frame.is_some_and(|frame| frame.active) {
+                None
+            } else if coordinated_route_morph.is_some() {
+                coordinated_route_morph
+            } else {
+                flip_morph_step(
+                    self.height_morph,
+                    (target_height - self.last_target_height).abs() > 0.5,
+                    self.last_rendered_height,
+                    now_ms,
+                    motion::reduced_motion(cx),
+                    route_snap,
+                )
+            };
         self.last_target_height = target_height;
         let pill_height = self
             .height_morph
@@ -7037,9 +7640,40 @@ impl Render for Composer {
             window.request_animation_frame();
         }
         self.last_rendered_height = pill_height;
-        let text_pt = morph_text_pad(morph_t);
-        let textarea_height =
-            (pill_height - strip_h - comment_strip_h - PILL_BORDER_V - ACTIONS_ROW_HEIGHT).max(0.0);
+        self.dock_clearance_correction = self.dock_frame.map_or(0.0, |frame| {
+            dock_height(if frame.docked { 1.0 } else { 0.0 })
+                + strip_h
+                + appshot_strip_height(appshot_count)
+                + comment_strip_h
+                - pill_height
+        });
+        // Route morphs use the dock's reversible clock; typing flips keep
+        // their existing local clock once the composer reaches its dock.
+        let layout_morph_t =
+            if self.dock_frame.is_some_and(|frame| frame.active) && !session_expanded {
+                if expanded {
+                    1.0 - dock_amount
+                } else {
+                    dock_amount
+                }
+            } else {
+                morph_t
+            };
+        let text_pt = morph_text_pad(layout_morph_t);
+        let surface_radius = COMPOSER_RADIUS - 4.0 * dock_amount;
+        let route_to_single_line =
+            self.dock_frame.is_some_and(|frame| frame.active) && !session_expanded;
+        let textarea_height = (pill_height
+            - strip_h
+            - appshot_strip_height(appshot_count)
+            - comment_strip_h
+            - PILL_BORDER_V
+            - ACTIONS_ROW_HEIGHT)
+            .max(if route_to_single_line {
+                INPUT_LINE_HEIGHT + text_pt + 4.0
+            } else {
+                0.0
+            });
         self.input.update(cx, |input, cx| {
             let height = if expanded {
                 (textarea_height - text_pt - 4.0).max(0.0)
@@ -7047,7 +7681,13 @@ impl Render for Composer {
                 INPUT_LINE_HEIGHT
             };
             let settled_height = if expanded {
-                base_height - PILL_BORDER_V - ACTIONS_ROW_HEIGHT - TEXTAREA_PAD_V
+                (base_height - PILL_BORDER_V - ACTIONS_ROW_HEIGHT - TEXTAREA_PAD_V).max(
+                    if route_to_single_line {
+                        INPUT_LINE_HEIGHT
+                    } else {
+                        0.0
+                    },
+                )
             } else {
                 INPUT_LINE_HEIGHT
             };
@@ -7069,9 +7709,8 @@ impl Render for Composer {
         let send_button = self.render_send_button(mode, cx);
         // Attach button — opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
-        // the same strip. The parent action cluster owns the spacing: adding a
-        // second margin here made the picker→attachment gap twice as wide as
-        // attachment→send and made the paperclip look detached.
+        // the same strip. The leading utility group owns the spacing between
+        // this button and the model picker.
         let attach = div()
             .id("composer-attach")
             .size(px(28.0))
@@ -7102,16 +7741,21 @@ impl Render for Composer {
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
         // the input inside the pill in both modes.
         let strip = self.render_attachment_strip(&theme, cx);
+        let appshot_strip = self.render_appshot_strip(&theme, window, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
 
-        // The pill chrome (zeron composer.tsx): `rounded-[26px] border
-        // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
-        // a hairline over a faint wash, never a solid grey box. Picker chips,
-        // attach, and the send circle all live INSIDE the pill.
-        let pill_bg = theme.input_glass_bg();
-        // No drop shadow on glass: it paints BEHIND the translucent fill and
-        // shows through as an inner glow (theme.rs's card_selected_shadows
-        // lesson; user report).
+        // A translucent cool silver/slate edge sits more naturally on frost
+        // than the general-purpose white/black separator color.
+        let pill_border = if theme.is_frost() {
+            match theme.appearance {
+                crate::theme::Appearance::Dark => gpui::hsla(210.0 / 360.0, 0.18, 0.78, 0.09),
+                crate::theme::Appearance::Light => gpui::hsla(210.0 / 360.0, 0.18, 0.32, 0.10),
+            }
+        } else {
+            theme.border
+        };
+        // Compensate for the transcript canvas beneath the frosted surface.
+        // Keep the opaque fallback when frost is disabled or unsupported.
         let pill = div()
             .on_mouse_down(
                 MouseButton::Left,
@@ -7123,34 +7767,91 @@ impl Render for Composer {
                     }
                 }),
             )
-            .rounded(px(COMPOSER_RADIUS))
-            .bg(pill_bg)
+            .rounded(px(surface_radius))
             .border_1()
-            .border_color(theme.border)
-            .when(!theme.is_frost(), |el| el.shadow_lg());
+            .border_color(pill_border)
+            .when(theme.is_frost(), |el| el.bg(theme.composer_sidebar_tint()))
+            .when(!theme.is_frost(), |el| {
+                el.bg(theme.input_glass_bg()).shadow_lg()
+            });
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
         // (round-9 follow-up: the send/attach/chips must not ride the height,
-        // and none of them fade — the full cluster stays visible throughout).
-        let cluster_dy = morph_cluster_dy(morph_t);
+        // while the model picker fades between its two horizontal anchors).
+        let cluster_dy = morph_cluster_dy(layout_morph_t);
+        // Share the height/route timeline instead of starting an independent
+        // animation. Reversals continue from the current handoff phase.
+        if self.model_handoff_morph != self.flip_morph {
+            self.model_handoff_from = self.model_handoff_position;
+            self.model_handoff_morph = self.flip_morph;
+        }
+        let compact_target = if expanded { 0.0 } else { 1.0 };
+        self.model_handoff_position =
+            if self.dock_frame.is_some_and(|frame| frame.active) && !session_expanded {
+                dock_amount
+            } else {
+                self.flip_morph.map_or(compact_target, |morph| {
+                    motion::lerp(
+                        self.model_handoff_from,
+                        compact_target,
+                        motion::EASE_IN_OUT.eval(morph.raw(now_ms)),
+                    )
+                })
+            };
+        let surface_width = self
+            .surface_bounds
+            .get()
+            .map_or(strip_width_hint + PILL_BORDER_V, |bounds| {
+                f32::from(bounds.size.width)
+            });
+        let model_travel = (surface_width
+            - PILL_BORDER_V
+            - 12.0
+            - 28.0
+            - ACTION_UTILITY_GAP
+            - self
+                .model_bounds
+                .get()
+                .map_or(0.0, |bounds| f32::from(bounds.size.width))
+            - ACTION_PRIMARY_GAP
+            - 28.0
+            - morph_cluster_inset(expanded, layout_morph_t))
+        .max(0.0);
+        let (model_side, model_opacity, model_drift) = model_handoff(self.model_handoff_position);
+        let model_offset = (model_side - compact_target) * model_travel + model_drift;
+        let measured_model_bounds = self.model_bounds.clone();
+        let model_picker = div()
+            .min_w_0()
+            .max_w(px(surface_width * 0.45))
+            .relative()
+            .left(px(model_offset))
+            .opacity(model_opacity)
+            .child(self.pickers.clone())
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| measured_model_bounds.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            );
         let body = if expanded {
             // Expanded: textarea on top (`px-4 pb-1 pt-4`), actions row
-            // (`px-3 pb-2.5 pt-1`, h-8 chips → 46px) ABSOLUTE at the pill's
+            // (12px bottom + 2px top, 32px chips → 46px) ABSOLUTE at the pill's
             // stationary bottom — constant screen-y through the morph, with
-            // the 2.5px compact↔expanded centering delta gliding out. The
+            // the 4.5px compact↔expanded centering delta gliding out. The
             // text viewport follows the animated height so it cannot paint
             // over the controls. Its width stays fixed (no tween rewraps);
-            // top padding eases 12→16. The whole control cluster stays at
-            // full alpha — chips,
-            // attach and send are all (near-)stationary on the bottom anchor.
-            let text_pt = morph_text_pad(morph_t);
+            // top padding eases 12→16. Attachment and Send stay on the bottom
+            // anchor while the model chip fades between its horizontal slots.
             pill.h(px(pill_height))
                 .overflow_hidden()
                 .relative()
                 .flex()
                 .flex_col()
                 .children(comments_chip)
+                .children(appshot_strip)
                 .children(strip)
                 .child(
                     div()
@@ -7177,9 +7878,9 @@ impl Render for Composer {
                         // Send has a larger structural separation.
                         .gap(px(ACTION_PRIMARY_GAP))
                         .pl(px(12.0))
-                        .pr(px(morph_cluster_inset(true, morph_t)))
-                        .pt(px(4.0))
-                        .pb(px(10.0))
+                        .pr(px(morph_cluster_inset(true, layout_morph_t)))
+                        .pt(px(2.0))
+                        .pb(px(12.0))
                         .child(
                             div()
                                 .flex_1()
@@ -7187,25 +7888,27 @@ impl Render for Composer {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .justify_end()
                                 .gap(px(ACTION_UTILITY_GAP))
-                                .child(self.pickers.clone())
-                                .child(attach),
+                                .child(attach)
+                                .child(model_picker),
                         )
                         .child(send_button),
                 )
         } else {
-            // Compact pill: input and the actions cluster on one 47px line
-            // (`py-3 pl-4 pr-2` textarea, `gap-2 py-1.5 pl-1 pr-2` cluster;
-            // the 22.75px line centers to the same 12px inset as `py-3`).
+            // Compact pill: attachment on the left, input in the middle,
+            // then model and Send on the right, all on one 47px line.
             // The row is BOTTOM-justified: during the collapse morph the pill
             // top sweeps down over a stationary row, the text walks down from
             // its expanded resting place via a decaying relative offset, and
-            // the whole inline cluster (chips + attach/send) holds its spot at
-            // full alpha (2.5px centering delta gliding in).
-            let text_glide = match self.flip_morph {
-                Some(m) if morphing => collapse_text_glide(m.from, morph_t),
-                _ => 0.0,
+            // attachment/Send hold their spots (4.5px centering delta gliding
+            // in), with the model handoff sharing that same timeline.
+            let text_glide = if self.dock_frame.is_some_and(|frame| frame.active) {
+                collapse_text_glide(dock_height(0.0), dock_amount)
+            } else {
+                match self.flip_morph {
+                    Some(m) if morphing => collapse_text_glide(m.from, morph_t),
+                    _ => 0.0,
+                }
             };
             pill.h(px(pill_height))
                 .overflow_hidden()
@@ -7213,6 +7916,7 @@ impl Render for Composer {
                 .flex_col()
                 .justify_end()
                 .children(comments_chip)
+                .children(appshot_strip)
                 .children(strip)
                 .child(
                     div()
@@ -7222,96 +7926,180 @@ impl Render for Composer {
                         .items_center()
                         .child(
                             div()
+                                .flex_none()
+                                .pl(px(12.0))
+                                .relative()
+                                .top(px(-cluster_dy))
+                                .child(attach),
+                        )
+                        .child(
+                            div()
                                 .flex_1()
                                 .min_w_0()
-                                .pl(px(16.0))
-                                .pr(px(8.0))
+                                .px(px(8.0))
                                 .relative()
                                 .top(px(-text_glide))
                                 .child(self.render_input_with_completion()),
                         )
                         .child(
                             div()
-                                .flex_none()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                // Same utility/primary grouping as expanded;
-                                // the right inset alone glides 12→8.
-                                .gap(px(ACTION_PRIMARY_GAP))
-                                .pl(px(4.0))
-                                .pr(px(morph_cluster_inset(false, morph_t)))
+                                .min_w_0()
+                                .max_w(px(surface_width * 0.45))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(ACTION_UTILITY_GAP))
-                                        .child(self.pickers.clone())
-                                        .child(attach),
-                                )
+                                .child(model_picker),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .pl(px(ACTION_PRIMARY_GAP))
+                                .pr(px(morph_cluster_inset(false, layout_morph_t)))
+                                .relative()
+                                .top(px(-cluster_dy))
                                 .child(send_button),
                         ),
                 )
         };
-        // New sessions: the TARGET row (device + project chips) sits ABOVE
-        // the pill, left-aligned like the checkout toolbar below it (user
-        // request — moved off the canvas). Existing sessions name their
-        // target in the titlebar instead.
-        let container = if new_chat {
-            let selectors = self
-                .pickers
-                .update(cx, |pickers, cx| pickers.render_target_selectors(cx));
-            container.child(selectors)
-        } else {
-            container
-        };
+        let new_thread_target_selectors = (new_thread_chrome_opacity > 0.0).then(|| {
+            self.pickers.update(cx, |pickers, cx| {
+                pickers.render_new_thread_target_selectors(cx)
+            })
+        });
+        let new_thread_git_selectors = (new_thread_chrome_opacity > 0.0)
+            .then(|| {
+                self.pickers.update(cx, |pickers, cx| {
+                    pickers.render_new_thread_git_selectors(cx)
+                })
+            })
+            .flatten();
+        let has_new_thread_git_selectors = self
+            .state
+            .read(cx)
+            .selected_space_row()
+            .is_some_and(|space| space.git_detected);
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
         // Frosted: the pill backdrop-blurs the transcript scrolling under it
         // (the popover glass treatment; radius matches the pill's rounding).
-        let container = container.child(
-            div()
-                .relative()
-                .child(crate::frost::frosted(
-                    COMPOSER_RADIUS,
-                    16.0,
-                    motion::fade_quick("composer-input", body),
-                ))
-                // Both completion popups span the full pill width above it —
-                // the file-mention and slash tokens are mutually exclusive.
-                .children(self.render_file_mention_popup(&theme, cx))
-                .children(self.render_slash_popup(&theme, cx)),
-        );
-        // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
-        // checkout-kind selector + ref picker for new sessions, read-only
-        // labels once the session exists. Git spaces only.
-        let footer = self
-            .pickers
-            .update(cx, |pickers, cx| pickers.render_footer(cx));
-        let container =
-            if !new_chat {
-                let usage = self.state.read(cx).context_usage;
-                container.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .child(div().flex_1().min_w_0().children(footer))
-                        .child(div().pr(px(10.0)).mb(px(-8.0)).child(
-                            crate::context_usage::render(usage, self.state.clone(), &theme),
-                        )),
+        // The shell keeps this entity under one parent on both routes. The
+        // surface itself never fades, and frost follows the same morph radius.
+        let pill_surface = div()
+            .relative()
+            .id("composer-surface")
+            .child(crate::frost::frosted(surface_radius, 16.0, body))
+            .child({
+                let measured = self.surface_bounds.clone();
+                // All prepaint completes before any paint. The background
+                // reads this cell during paint, never last frame's geometry.
+                gpui::canvas(
+                    move |bounds, _, _| measured.set(Some(bounds)),
+                    |_, _, _, _| {},
                 )
-            } else {
-                match footer {
-                    Some(footer) => container.child(footer),
-                    None => container,
-                }
-            };
+                .absolute()
+                .inset_0()
+            })
+            // Both completion popups span the full pill width above it —
+            // the file-mention and slash tokens are mutually exclusive.
+            .children(self.render_file_mention_popup(&theme, cx))
+            .children(self.render_slash_popup(&theme, cx));
+        // Restore the original chip-only selector treatment: destination at
+        // the top-right, no surrounding surface. Cancel the column gap as the
+        // row collapses so the pill never jumps at the route boundary.
+        let container = if self.dock_frame.is_some() {
+            // Floating selectors share the surface's origin and never change its height.
+            container.relative().child(
+                div()
+                    .id("dock-target-selectors")
+                    .absolute()
+                    .top(px(-28.0))
+                    .left(px(Theme::SPACE_LG + 10.0))
+                    .right(px(Theme::SPACE_LG + 10.0))
+                    .h(px(NEW_THREAD_SELECTOR_ROW_HEIGHT))
+                    .flex()
+                    .items_start()
+                    .justify_end()
+                    .opacity(new_thread_chrome_opacity)
+                    .children(new_thread_target_selectors),
+            )
+        } else if new_thread_chrome > 0.0 {
+            container.child(
+                div()
+                    .w_full()
+                    .h(px(NEW_THREAD_SELECTOR_ROW_HEIGHT * new_thread_chrome))
+                    .mb(px(-Theme::SPACE_SM * (1.0 - new_thread_chrome)))
+                    .px(px(10.0))
+                    .flex()
+                    .items_start()
+                    .justify_end()
+                    .opacity(new_thread_chrome_opacity)
+                    .children(new_thread_target_selectors),
+            )
+        } else {
+            container
+        };
+        let container = container.child(pill_surface);
+
+        // The lower slot keeps a stable footprint for Git projects while its
+        // old floating checkout/ref controls dissolve into the session footer.
+        // Non-Git sessions grow the slot continuously from zero.
+        let session_chrome = 1.0 - new_thread_chrome;
+        let bottom_slot = if has_new_thread_git_selectors || self.dock_frame.is_some() {
+            1.0
+        } else {
+            session_chrome
+        };
+        let container = if bottom_slot > 0.0 {
+            let footer = (session_chrome_opacity > 0.0).then(|| {
+                self.pickers
+                    .update(cx, |pickers, cx| pickers.render_footer(cx))
+            });
+            let usage = self.state.read(cx).context_usage;
+            container.child(
+                div()
+                    .w_full()
+                    .h(px(SESSION_FOOTER_HEIGHT * bottom_slot))
+                    .mt(px(-Theme::SPACE_SM * (1.0 - bottom_slot)))
+                    .mb(px(-Theme::SPACE_SM * bottom_slot))
+                    .relative()
+                    .when(new_thread_chrome_opacity > 0.0, |slot| {
+                        slot.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .px(px(10.0))
+                                .flex()
+                                .items_center()
+                                .opacity(new_thread_chrome_opacity)
+                                .children(new_thread_git_selectors),
+                        )
+                    })
+                    .when(session_chrome_opacity > 0.0, |slot| {
+                        slot.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .w_full()
+                                .h(px(SESSION_FOOTER_HEIGHT))
+                                .flex()
+                                .items_center()
+                                .opacity(session_chrome_opacity)
+                                .child(div().flex_1().min_w_0().children(footer.flatten()))
+                                .children(crate::context_usage::has_window(usage).then(|| {
+                                    div().flex_none().pr(px(10.0)).child(
+                                        crate::context_usage::render(
+                                            usage,
+                                            self.state.clone(),
+                                            &theme,
+                                        ),
+                                    )
+                                })),
+                        )
+                    }),
+            )
+        } else {
+            container
+        };
         // Full-size preview of a staged thumbnail (AttachmentPreviewDialog).
         if let Some(preview) = self.preview.clone() {
             if std::mem::take(&mut self.preview_focus_pending) {
@@ -7319,7 +8107,7 @@ impl Render for Composer {
             }
             let weak = cx.weak_entity();
             return container.child(attachments::lightbox(
-                window.viewport_size(),
+                window,
                 &preview,
                 &self.preview_focus,
                 move |window, cx| {
@@ -7333,6 +8121,7 @@ impl Render for Composer {
                         window.focus(&input_focus, cx);
                     }
                 },
+                cx,
             ));
         }
         container
@@ -7367,6 +8156,78 @@ mod tests {
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap();
         (dir, window)
+    }
+
+    #[gpui::test]
+    fn dock_morph_restores_skinny_height_with_a_continuous_editor_origin(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let input = handle
+            .read_with(cx, |composer, _| composer.input.clone())
+            .unwrap();
+        for docked in [true, false] {
+            let amounts = if docked {
+                [0.0, 0.2, 0.6, 0.98, 1.0]
+            } else {
+                [1.0, 0.98, 0.6, 0.2, 0.0]
+            };
+            for amount in amounts {
+                handle
+                    .update(cx, |composer, _, cx| {
+                        composer.state.update(cx, |state, _| {
+                            state.selected_chat = docked.then(|| "chat".into());
+                        });
+                        composer.on_state_changed(cx);
+                        composer
+                            .input
+                            .update(cx, |input, cx| input.set_text("Hi", cx));
+                        composer.expanded_mode = false;
+                        let mut frame = crate::composer_dock::DockFrame::settled(docked);
+                        frame.amount = amount;
+                        frame.active = amount != if docked { 1.0 } else { 0.0 };
+                        composer.set_dock_frame(frame, cx);
+                    })
+                    .unwrap();
+                cx.update_window(handle.into(), |_, window, cx| {
+                    window.draw(cx).clear();
+                })
+                .unwrap();
+                handle.read_with(cx, |composer, cx| {
+                    assert_eq!(composer.input, input);
+                    let surface = composer.surface_bounds.get().unwrap();
+                    let origin = input.read(cx).last_bounds.unwrap().origin;
+                    assert!((f32::from(origin.y - surface.top()) - (17.0 - 4.0 * amount)).abs() <= 1.0,
+                        "editor jumped: docked={docked}, amount={amount}, origin={origin:?}, surface={surface:?}");
+                    let model = composer.model_bounds.get().unwrap();
+                    let left = surface.left() + px(1.0 + 12.0 + 28.0 + ACTION_UTILITY_GAP);
+                    let travel = surface.size.width - px(2.0 + 12.0 + 28.0 + ACTION_UTILITY_GAP
+                        + ACTION_PRIMARY_GAP + 28.0 + motion::lerp(12.0, 8.0, amount)) - model.size.width;
+                    let (side, _, drift) = model_handoff(amount);
+                    let expected_x = left + travel * side + px(drift);
+                    assert!((f32::from(model.left() - expected_x)).abs() <= 1.0,
+                        "model jumped: docked={docked}, amount={amount}, actual={model:?}, expected={expected_x:?}");
+                    let expected = if docked { COMPACT_TOTAL_HEIGHT } else { COMPOSER_MIN_HEIGHT };
+                    assert!((composer.last_rendered_height + composer.dock_clearance_correction - expected).abs() < 0.1);
+                    assert!((composer.last_rendered_height - motion::lerp(COMPOSER_MIN_HEIGHT, COMPACT_TOTAL_HEIGHT, amount)).abs() < 0.1);
+                }).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn model_handoff_hides_relocation_and_keeps_visible_motion_local() {
+        assert_eq!(model_handoff(0.0), (0.0, 1.0, 0.0));
+        assert_eq!(model_handoff(1.0), (1.0, 1.0, -0.0));
+        for amount in [0.44, 0.49, 0.50, 0.51, 0.56] {
+            assert!(model_handoff(amount).1 < 0.0001);
+        }
+        for step in 0..=100 {
+            let (side, opacity, drift) = model_handoff(step as f32 / 100.0);
+            assert!((0.0..=1.0).contains(&opacity));
+            assert!(drift.abs() <= 6.0);
+            assert!(side == 0.0 || side == 1.0);
+        }
     }
 
     #[gpui::test]
@@ -7582,6 +8443,41 @@ mod tests {
                 "Pending edits must still block submission"
             );
         });
+    }
+
+    /// Issue #406: Enter submits — it must never stop a run. Stop mode only
+    /// exists on a live run with an EMPTY composer, so a habitual
+    /// double-Enter after sending interrupted the just-dispatched prompt
+    /// and the agent ate it silently. Keyboard stop is the Esc setting's
+    /// job; Enter on an empty composer is a no-op.
+    #[gpui::test]
+    fn enter_on_empty_composer_during_a_live_run_never_interrupts(cx: &mut gpui::TestAppContext) {
+        // RpcClient::new spawns its reader on tokio — give the test a reactor.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        // The client's write end: any RPC Enter dispatches lands here.
+        let (out, mut server_in) = tokio::sync::mpsc::channel::<String>(16);
+        let (_server_out, inbound) = tokio::sync::mpsc::channel::<String>(16);
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+            state.selected_chat = Some("c".into());
+            // A send in flight reads as Working — the double-Enter window.
+            state.begin_pending_send("c", "m1", chrono::Utc::now());
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            assert_eq!(composer.button_mode(cx), SendButtonMode::Stop);
+            composer.on_submit(cx);
+            // interrupt_chat marks the chat before its RPC even flies.
+            assert!(!composer.interrupting.contains("c"));
+        });
+        // If Enter had dispatched an interrupt, the spawned call would have
+        // written its frame into the channel by the time the executor parks.
+        cx.run_until_parked();
+        assert!(server_in.try_recv().is_err());
     }
 
     /// The press intent is judged by eye everywhere except here: that a
@@ -8084,6 +8980,37 @@ mod tests {
     }
 
     #[test]
+    fn appshot_strip_height_tracks_cards() {
+        assert_eq!(appshot_strip_height(0), 0.0);
+        assert_eq!(appshot_strip_height(1), STRIP_PAD_TOP + APPSHOT_TILE_HEIGHT);
+        assert_eq!(appshot_strip_height(2), appshot_strip_height(1));
+    }
+
+    #[test]
+    fn appshot_images_share_height_and_adapt_width_without_losing_aspect_ratio() {
+        let landscape = appshot_contained_size(Some((1600, 900)), 320.0);
+        assert!((landscape.0 - 234.66667).abs() < 0.01);
+        assert_eq!(landscape.1, APPSHOT_IMAGE_MAX_HEIGHT);
+        let portrait = appshot_contained_size(Some((900, 1600)), 320.0);
+        assert!((portrait.0 - 74.25).abs() < 0.01);
+        assert_eq!(portrait.1, landscape.1);
+        assert_eq!(
+            appshot_contained_size(Some((1000, 1000)), 320.0),
+            (132.0, 132.0)
+        );
+        // Narrow side-by-side layouts and panoramas fit without distortion.
+        let narrow = appshot_contained_size(Some((1600, 900)), 160.0);
+        assert_eq!(narrow, (160.0, 90.0));
+        assert_eq!(
+            appshot_contained_size(Some((4000, 1000)), 900.0),
+            (320.0, 80.0)
+        );
+        let fallback = appshot_contained_size(None, 320.0);
+        assert!((fallback.0 - 211.2).abs() < 0.01);
+        assert_eq!(fallback.1, 132.0);
+    }
+
+    #[test]
     fn input_wheel_scroll_uses_gpui_direction_and_clamps() {
         // Positive wheel delta moves toward the start; negative moves down.
         assert_eq!(input_scroll_offset(40.0, 20.0, 200.0, 100.0), 20.0);
@@ -8426,6 +9353,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
+            spec: motion::COLLAPSE,
         };
         // Starts exactly at the committed height…
         let mut prev = m.height(124.0, 0.0);
@@ -8445,6 +9373,7 @@ mod tests {
         let down = FlipMorph {
             from: 124.0,
             start_ms: 0.0,
+            spec: motion::COLLAPSE,
         };
         assert!(down.height(49.0, 90.0) < 124.0);
         assert!(down.height(49.0, 90.0) > 49.0);
@@ -8455,6 +9384,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
+            spec: motion::COLLAPSE,
         };
         let mid = m.height(124.0, 90.0);
         assert!(mid > 49.0 && mid < 124.0);
@@ -8483,6 +9413,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
+            spec: motion::COLLAPSE,
         };
         assert_eq!(
             flip_morph_step(Some(m), false, 80.0, 50.0, false, true),
@@ -8505,7 +9436,7 @@ mod tests {
         assert_eq!(collapse_text_glide(124.0, 1.0), 0.0);
         // At the commit instant the pieces start from the OLD mode's resting
         // geometry: text pad at the compact 12px inset, cluster displaced by
-        // exactly the 2.5px centering delta.
+        // exactly the 4.5px centering delta.
         assert_eq!(morph_text_pad(0.0), 12.0);
         assert_eq!(morph_cluster_dy(0.0), CLUSTER_Y_DELTA);
         // Collapse glide: starts where the expanded text sat (17px below the
@@ -8549,6 +9480,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
+            spec: motion::COLLAPSE,
         };
         // Auto-grow can move the target mid-morph: evaluation tracks the
         // live value instead of finishing on a stale height.
@@ -8558,6 +9490,36 @@ mod tests {
         assert_eq!(m.progress(180.0), 1.0);
         let mid = m.progress(90.0);
         assert!(mid > 0.0 && mid < 1.0);
+    }
+
+    #[test]
+    fn new_thread_route_changes_use_the_coordinated_timeline() {
+        let m = FlipMorph::new_thread_transition(124.0, 0.0);
+        assert_eq!(m.spec, motion::NEW_THREAD_TRANSITION);
+        assert_eq!(m.height(49.0, 0.0), 124.0);
+        assert!(m.height(49.0, 250.0) < 124.0);
+        assert!(m.height(49.0, 250.0) > 49.0);
+        assert_eq!(m.height(49.0, 420.0), 49.0);
+        let reverse = FlipMorph::new_thread_transition(49.0, 0.0);
+        assert_eq!(reverse.height(124.0, 0.0), 49.0);
+        assert_eq!(reverse.height(124.0, 420.0), 124.0);
+    }
+
+    #[test]
+    fn new_thread_selectors_restore_the_compact_floating_row() {
+        assert_eq!(NEW_THREAD_SELECTOR_ROW_HEIGHT, 20.0);
+        assert_eq!(SESSION_FOOTER_HEIGHT, 24.0);
+    }
+
+    #[test]
+    fn route_chrome_crossfade_never_duplicates_picker_controls() {
+        assert_eq!(route_chrome_opacities(1.0), (1.0, 0.0));
+        assert_eq!(route_chrome_opacities(0.5), (0.0, 0.0));
+        assert_eq!(route_chrome_opacities(0.0), (0.0, 1.0));
+        for step in 0..=20 {
+            let (new_thread, session) = route_chrome_opacities(step as f32 / 20.0);
+            assert!(new_thread == 0.0 || session == 0.0);
+        }
     }
 
     #[test]
@@ -8571,7 +9533,7 @@ mod tests {
     }
 
     #[test]
-    fn modified_submit_sends_content_and_advances_only_when_empty() {
+    fn modified_submit_sends_content_and_activates_latest_queue_row_when_empty() {
         assert_eq!(
             modified_submit_target(composer_has_content("message", 0, 0)),
             ModifiedSubmitTarget::SubmitContent
@@ -8586,7 +9548,7 @@ mod tests {
         );
         assert_eq!(
             modified_submit_target(composer_has_content("  ", 0, 0)),
-            ModifiedSubmitTarget::ActivateQueueHead
+            ModifiedSubmitTarget::ActivateLatestQueued
         );
     }
 
@@ -8833,5 +9795,87 @@ mod tests {
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
+    }
+}
+
+#[cfg(test)]
+mod appshot_rebase_tests {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+
+    #[gpui::test]
+    fn appshot_only_draft_counts_as_content_and_removal_clears_it(cx: &mut TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            let shot = appshots::tests::shot();
+            composer.stage_appshot(shot.clone(), cx);
+            assert!(composer_has_content(
+                "",
+                composer.staged().len() + composer.staged_appshots().len(),
+                0
+            ));
+            composer.remove_appshot(&shot.id, cx);
+            assert!(composer.staged_appshots().is_empty());
+            assert!(!composer_has_content(
+                "",
+                composer.staged().len() + composer.staged_appshots().len(),
+                0
+            ));
+        });
+    }
+
+    #[gpui::test]
+    fn failed_send_restores_complete_appshots_without_duplicates(cx: &mut TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            let original = appshots::tests::shot();
+            let mut fresh = original.clone();
+            fresh.id = "fresh".into();
+            composer.stage_appshot_for("minted".into(), original.clone(), cx);
+            composer.stage_appshot(fresh, cx);
+            composer.restore_failed_appshots(&[original.clone()], "minted", "");
+            assert_eq!(composer.staged_appshots().len(), 2);
+            assert_eq!(
+                composer.staged_appshots()[0].accessibility,
+                original.accessibility
+            );
+            assert_eq!(
+                composer.staged_appshots()[0].screenshot.id,
+                original.screenshot.id
+            );
+            assert_eq!(composer.staged_appshots()[1].id, "fresh");
+            assert!(!composer.appshots.contains_key("minted"));
+        });
+    }
+
+    #[gpui::test]
+    fn remote_queue_removal_recovers_both_appshot_drafts(cx: &mut TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            let original = appshots::tests::shot();
+            let mut edited = original.clone();
+            edited.id = "edited".into();
+            composer.stage_appshot(edited, cx);
+            composer.queue_edit_draft = Some(("original".into(), vec![], vec![original]));
+            composer.editing_queued = Some("removed-row".into());
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("edited", cx));
+            composer.on_state_changed(cx);
+            assert!(composer.editing_queued.is_none());
+            assert_eq!(composer.staged_appshots().len(), 2);
+            assert_eq!(composer.input.read(cx).text(), "original\n\nedited");
+        });
+    }
+}
+
+#[cfg(feature = "appshots-fixture")]
+impl Composer {
+    pub fn fixture_clear_appshots(&mut self, cx: &mut Context<Self>) {
+        self.appshots.clear();
+        cx.notify();
     }
 }

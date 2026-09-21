@@ -9,12 +9,41 @@ use super::{
     workspace_path_drag_ghost,
 };
 use crate::{
+    file_icons::{self, FileIconIdentity},
     icons::{self, icon},
+    popover,
     theme::Theme,
 };
 
 pub const TREE_ROW_HEIGHT: f32 = 27.0;
-const TREE_INDENT: f32 = 14.0;
+pub(super) const TREE_INDENT: f32 = 14.0;
+
+/// Draw each ancestor's guide in the row itself so virtualized rows join
+/// seamlessly, including when the parent has scrolled out of view.
+pub(super) fn with_indent_guides(
+    row: AnyElement,
+    depth: usize,
+    height: f32,
+    theme: &Theme,
+) -> AnyElement {
+    div()
+        .relative()
+        .h(px(height))
+        .w_full()
+        .flex_none()
+        .children((0..depth).map(|level| {
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                // Align with the center of the ancestor's 14px disclosure slot.
+                .left(px(8.0 + 7.0 + level as f32 * TREE_INDENT))
+                .w(px(1.0))
+                .bg(theme.border)
+        }))
+        .child(row)
+        .into_any_element()
+}
 
 /// Keep the viewport attached to a path rather than an index when rows move.
 pub(super) fn sync_list_rows(
@@ -63,8 +92,90 @@ pub(super) fn sync_list_rows(
     list.scroll_to(anchor);
 }
 
+/// The tree rail's geometry straight from the list state: track origin and
+/// viewport from [`gpui::ListState::viewport_bounds`] (window space; zero
+/// until first layout, so the rail simply stays hidden), content extent from
+/// the measured item summaries via [`gpui::ListState::max_offset_for_scrollbar`],
+/// and the position from [`gpui::ListState::scroll_px_offset_for_scrollbar`]
+/// (negative while scrolled — flipped here to the positive distance). Row
+/// counts are never multiplied in: row variants need not share a height.
+fn tree_rail_geometry(
+    list: &gpui::ListState,
+) -> Option<(popover::MenuScrollbarMetrics, gpui::Pixels)> {
+    let bounds = list.viewport_bounds();
+    let viewport = f32::from(bounds.size.height);
+    let max_scroll = f32::from(list.max_offset_for_scrollbar().y);
+    let offset = -f32::from(list.scroll_px_offset_for_scrollbar().y);
+    let metrics =
+        popover::MenuScrollbarMetrics::from_parts(viewport, viewport + max_scroll, offset)?;
+    Some((metrics, bounds.top()))
+}
+
+/// The file tree's share of the shared floating rail: it owns no scroll
+/// handle, so geometry comes from the list state's own accessors and drags
+/// land through the list state's scrollbar offset setter.
+impl popover::ScrollRailHost for FilesSurface {
+    fn rail_bar(&mut self) -> &mut popover::MenuScrollbarState {
+        &mut self.tree_bar
+    }
+
+    fn rail_metrics(&mut self) -> Option<popover::MenuScrollbarMetrics> {
+        let (metrics, _) = tree_rail_geometry(&self.tree_list)?;
+        let offset = -f32::from(self.tree_list.scroll_px_offset_for_scrollbar().y);
+        self.rail_bar().note_scroll_offset(offset);
+        Some(metrics)
+    }
+
+    fn rail_press(&mut self, pointer_y: gpui::Pixels) -> bool {
+        let Some((metrics, track_top)) = tree_rail_geometry(&self.tree_list) else {
+            return false;
+        };
+        self.rail_bar()
+            .begin_press_in(&metrics, track_top, pointer_y);
+        self.apply_tree_rail_target(&metrics, track_top, pointer_y)
+    }
+
+    fn rail_drag_to(&mut self, pointer_y: gpui::Pixels) -> bool {
+        let Some((metrics, track_top)) = tree_rail_geometry(&self.tree_list) else {
+            return false;
+        };
+        self.apply_tree_rail_target(&metrics, track_top, pointer_y)
+    }
+}
+
 impl FilesSurface {
+    /// Apply a shared-rail drag target: the fraction of max scroll goes back
+    /// through the list state's own scrollbar offset setter, which clamps to
+    /// the live content height. `false` when no drag is engaged.
+    fn apply_tree_rail_target(
+        &mut self,
+        metrics: &popover::MenuScrollbarMetrics,
+        track_top: gpui::Pixels,
+        pointer_y: gpui::Pixels,
+    ) -> bool {
+        let Some(fraction) = self.tree_bar.drag_target_in(metrics, track_top, pointer_y) else {
+            return false;
+        };
+        let target = px(-fraction * metrics.max_scroll);
+        self.tree_list
+            .set_offset_from_scrollbar(gpui::Point::new(px(0.0), target));
+        true
+    }
+
+    pub(super) fn on_tree_scrolled(&mut self, cx: &mut Context<Self>) {
+        // The list repaints itself; the floating rail needs a view pass.
+        cx.notify();
+    }
+
+    fn on_tree_hovered(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        if self.tree_bar.set_list_hovered(*hovered) {
+            cx.notify();
+        }
+    }
+
     pub(super) fn render_tree(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let scrollbar = popover::rail(self, "files-tree-scrollbar", &theme, cx);
         div()
             .id("files-tree")
             .role(gpui::Role::Tree)
@@ -75,6 +186,7 @@ impl FilesSurface {
             .flex()
             .flex_col()
             .track_focus(&self.tree_focus)
+            .on_hover(cx.listener(Self::on_tree_hovered))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| this.tree_focus.focus(window, cx)),
@@ -88,6 +200,7 @@ impl FilesSurface {
                     .min_h_0()
                     .with_sizing_behavior(ListSizingBehavior::Auto),
             )
+            .children(scrollbar)
             .into_any_element()
     }
 
@@ -102,7 +215,7 @@ impl FilesSurface {
         };
         let theme = Theme::of(cx).clone();
         let padding = 8.0 + row.depth as f32 * TREE_INDENT;
-        match row.kind {
+        let content = match row.kind {
             VisibleRowKind::Entry => {
                 let Some(node) = self.tree.node(&row.path).cloned() else {
                     return gpui::Empty.into_any_element();
@@ -111,16 +224,22 @@ impl FilesSurface {
                 let selected = self.tree.selected() == Some(path.as_str());
                 let focused = self.tree_focus.is_focused(window);
                 let is_directory = node.entry.kind == WorkspaceEntryKind::Directory;
+                let decoration = self.git_decoration(&row.path, is_directory, cx);
                 let drag_payload = WorkspacePathDrag::new(path.clone(), is_directory);
                 let expanded = is_directory && self.tree.is_expanded(&path);
-                let text_color = if selected {
+                let text_color = if let Some(decoration) = decoration {
+                    decoration.color(&theme)
+                } else if selected {
                     theme.text
                 } else {
                     theme.text_muted
                 };
-                let file_icon = match node.entry.kind {
-                    WorkspaceEntryKind::Directory => icons::FOLDER,
-                    WorkspaceEntryKind::File | WorkspaceEntryKind::Symlink => icons::DOCUMENT,
+                let file_identity = match node.entry.kind {
+                    WorkspaceEntryKind::Directory => {
+                        FileIconIdentity::directory(&node.entry.name, expanded)
+                    }
+                    WorkspaceEntryKind::File => FileIconIdentity::file(&node.entry.name),
+                    WorkspaceEntryKind::Symlink => FileIconIdentity::symlink(&node.entry.name),
                 };
                 div()
                     .id(gpui::SharedString::from(format!(
@@ -140,7 +259,9 @@ impl FilesSurface {
                     .items_center()
                     .gap(px(4.0))
                     .cursor_pointer()
-                    .when(node.entry.ignored, |element| element.opacity(0.52))
+                    .when(node.entry.ignored && decoration.is_none(), |element| {
+                        element.opacity(0.52)
+                    })
                     .when(selected, |element| {
                         element.bg(crate::theme::wash(if focused { 0.12 } else { 0.08 }))
                     })
@@ -151,9 +272,11 @@ impl FilesSurface {
                         this.tree_focus.focus(window, cx);
                         this.activate_tree_path(path.clone(), cx);
                     }))
-                    .on_drag(drag_payload, |payload, _, _, cx| {
-                        cx.stop_propagation();
-                        workspace_path_drag_ghost(payload, cx)
+                    .when(crate::click_activation_drag_enabled(), |element| {
+                        element.on_drag(drag_payload, |payload, _, _, cx| {
+                            cx.stop_propagation();
+                            workspace_path_drag_ghost(payload, cx)
+                        })
                     })
                     .child(
                         div()
@@ -175,14 +298,9 @@ impl FilesSurface {
                             }),
                     )
                     .child(
-                        icon(file_icon)
-                            .size(px(13.0))
-                            .flex_none()
-                            .text_color(if is_directory {
-                                theme.text_muted
-                            } else {
-                                text_color
-                            }),
+                        file_icons::icon(file_identity, theme.appearance)
+                            .size(px(14.0))
+                            .flex_none(),
                     )
                     .child(
                         div()
@@ -261,7 +379,8 @@ impl FilesSurface {
                         .child("Load more…"),
                 )
                 .into_any_element(),
-        }
+        };
+        with_indent_guides(content, row.depth, TREE_ROW_HEIGHT, &theme)
     }
 
     pub(super) fn activate_tree_path(&mut self, path: String, cx: &mut Context<Self>) {

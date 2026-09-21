@@ -4,7 +4,8 @@
 //!
 //! VERSION PIN: the app-server API is EXPERIMENTAL (`capabilities.
 //! experimentalApi`); this driver is validated against codex-cli 0.153.4 —
-//! revalidate the method/notification surface when bumping past it.
+//! imageGeneration additionally follows the 0.154.0 schema (savedPath only).
+//! Revalidate the method/notification surface when bumping past it.
 //!
 //! - `initialize` handshake (clientInfo + `capabilities.experimentalApi`) then
 //!   the `initialized` notification; unknown notification methods tolerated.
@@ -41,7 +42,6 @@ mod subagents;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,7 +50,6 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
-use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -59,6 +58,7 @@ use zeron_proto::{
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
+use crate::process::{Child, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
@@ -71,46 +71,40 @@ use normalize::{
 /// PATH in ways a GUI/service launch never sees — see [`crate::shell_env`]),
 /// then known install locations as a last resort. Resolved per call — cheap
 /// after the snapshot is cached.
-fn resolve_codex_executable() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("CODEX_EXECUTABLE")
-        && !p.is_empty()
-    {
-        return Some(PathBuf::from(p));
+pub fn resolve_codex_executable() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("CODEX_EXECUTABLE").filter(|p| !p.is_empty()) {
+        return crate::executable::validate_native_override(&PathBuf::from(p)).ok();
     }
-    let exe = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
+    let mut extra = Vec::new();
+    if let Some(home) = crate::executable::home_dir() {
+        extra.push(home.join(".local").join("bin").join("codex"));
+        extra.push(home.join(".codex").join("bin").join("codex"));
+        extra.push(home.join(".npm-global").join("bin").join("codex"));
     }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".local").join("bin").join("codex"));
-        candidates.push(home.join(".codex").join("bin").join("codex"));
-        candidates.push(home.join(".npm-global").join("bin").join("codex"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/codex"));
-    candidates.push(PathBuf::from("/usr/local/bin/codex"));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    extra.push(PathBuf::from("/opt/homebrew/bin/codex"));
+    extra.push(PathBuf::from("/usr/local/bin/codex"));
+    crate::executable::find_on_paths("codex", extra)
+}
+
+/// A ready-to-spawn `codex login` command for the engine's account flow.
+///
+/// Shares the harness's full resolution (`CODEX_EXECUTABLE`, PATH, login-shell
+/// snapshot, install locations — including the Windows npm payload layout) and
+/// its child-PATH composition, so "Add account" launches exactly the binary
+/// the harness itself would run. `CODEX_HOME` isolates the login from the live
+/// `~/.codex` session; the caller owns stdio wiring and cancellation.
+pub fn login_command(codex_home: &std::path::Path) -> Result<Command, HarnessError> {
+    let exe = CodexHarness::new().resolve_executable()?;
+    let mut cmd = Command::new(&exe);
+    crate::compose_child_path(&mut cmd, &exe);
+    cmd.arg("login").env("CODEX_HOME", codex_home);
+    Ok(cmd)
 }
 
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
 /// fake app server with [`CodexHarness::with_executable`].
 pub struct CodexHarness {
+    models_cache: crate::catalog::Catalog,
     executable: Option<PathBuf>,
     /// Grace between `turn/interrupt` and SIGTERM.
     interrupt_grace: Duration,
@@ -124,6 +118,7 @@ pub struct CodexHarness {
 impl Default for CodexHarness {
     fn default() -> Self {
         Self {
+            models_cache: crate::catalog::Catalog::default(),
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
@@ -152,14 +147,20 @@ impl CodexHarness {
 
     fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
         if let Some(p) = &self.executable {
-            return Ok(p.clone());
+            return crate::executable::validate_native_override(p);
+        }
+        if let Some(p) = std::env::var_os("CODEX_EXECUTABLE")
+            && !p.is_empty()
+        {
+            return crate::executable::validate_native_override(&PathBuf::from(p));
         }
         resolve_codex_executable().ok_or_else(|| {
             HarnessError::NotInstalled(
                 "codex (searched PATH, the login shell's PATH, ~/.local/bin, \
                  ~/.codex/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, \
-                 and fnm/nvm/volta/pnpm/bun install dirs; set CODEX_EXECUTABLE to \
-                 override)"
+                 and fnm/nvm/volta/pnpm/bun install dirs; Windows also checks USERPROFILE \
+                 and explicit NVM_SYMLINK/VOLTA_HOME/PNPM_HOME; set CODEX_EXECUTABLE \
+                 to override)"
                     .into(),
             )
         })
@@ -181,7 +182,7 @@ impl CodexHarness {
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
+                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
             } else {
                 HarnessError::Io(e)
             }
@@ -234,7 +235,7 @@ impl CodexHarness {
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
+                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
             } else {
                 HarnessError::Io(e)
             }
@@ -271,6 +272,9 @@ impl CodexHarness {
                     params["cursor"] = Value::String(cursor.to_owned());
                 }
                 let page = client.request("model/list", params).await?;
+                if legacy_model_page(&page) {
+                    tracing::warn!(binary_path = %exe.display(), binary_version = ?crate::executable::binary_version(&exe), "Model discovery response lacks hidden flags; CLI may be outdated");
+                }
                 let (page_models, next_cursor) = parse_model_list_page(&page);
                 for (model, is_default) in page_models {
                     if model_ids.insert(model.id.clone()) {
@@ -295,6 +299,13 @@ impl CodexHarness {
             {
                 let default_model = models.remove(index);
                 models.insert(0, default_model);
+            }
+            if models.is_empty() {
+                return Err(crate::CatalogFailure {
+                    code: crate::CatalogFailureCode::Failed,
+                    message: "Codex returned an empty model catalog".into(),
+                }
+                .into());
             }
             Ok::<Vec<Model>, HarnessError>(models)
         };
@@ -403,6 +414,14 @@ fn model_service_tier(item: &Value) -> Option<ModelOption> {
     })
 }
 
+fn legacy_model_page(page: &Value) -> bool {
+    page.get("data")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            !items.is_empty() && items.iter().all(|item| item.get("hidden").is_none())
+        })
+}
+
 /// Parse one `model/list` page. Unknown future reasoning levels are ignored
 /// independently instead of invalidating the complete catalog.
 fn parse_model_list_page(result: &Value) -> (Vec<(Model, bool)>, Option<String>) {
@@ -438,6 +457,17 @@ fn parse_model_list_page(result: &Value) -> (Vec<(Model, bool)>, Option<String>)
             .map(str::trim)
             .filter(|description| !description.is_empty())
             .map(str::to_owned);
+        let description = match item
+            .get("upgrade")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            Some(upgrade) => Some(format!(
+                "{}(upgrade: {upgrade})",
+                description.map(|d| format!("{d} ")).unwrap_or_default()
+            )),
+            None => description,
+        };
         let reasoning_levels = item
             .get("supportedReasoningEfforts")
             .and_then(Value::as_array)
@@ -540,7 +570,7 @@ impl Harness for CodexHarness {
         REASONING_LEVELS
     }
     fn installed(&self) -> bool {
-        self.executable.is_some() || resolve_codex_executable().is_some()
+        self.resolve_executable().is_ok()
     }
     /// Done is the CLI's own terminal frame, for wake turns too.
     fn deterministic_turn_end(&self) -> bool {
@@ -549,19 +579,32 @@ impl Harness for CodexHarness {
 
     /// The signed-in account's visible `model/list` is authoritative. A
     /// curated snapshot keeps the picker operational when the experimental
-    /// discovery call is unavailable or temporarily fails; failed probes are
-    /// intentionally not cached so reopening the picker retries rollout state.
+    /// discovery call is unavailable and no last-good catalog exists. Explicit
+    /// picker refreshes bypass cooldowns while overlapping callers coalesce.
+    fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
+        crate::model_context::context(self.id(), &self.resolve_executable()?, &[]).map(Some)
+    }
+    fn fallback_models(&self) -> Vec<Model> {
+        static_models()
+    }
+    async fn model_catalog(&self, force: bool) -> Result<crate::ModelCatalog, HarnessError> {
+        self.model_context()?.unwrap().log();
+        self.models_cache
+            .get_with(
+                force,
+                || self.model_context().map(|c| c.unwrap().key()),
+                || self.discover_models(),
+            )
+            .await
+    }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        match self.discover_models().await {
-            Ok(models) if !models.is_empty() => Ok(models),
-            Ok(_) => Ok(static_models()),
+        match self.model_catalog(false).await {
+            Ok(catalog) => Ok(catalog.models),
+            Err(error) if !crate::CatalogFailure::classify(&error).allows_stale() => Err(error),
             Err(error) => {
-                tracing::debug!(
-                    target: "zeron_harness::codex",
-                    "model/list discovery failed; using fallback catalog: {error}"
-                );
-                Ok(static_models())
+                tracing::warn!(%error, source = "static", "Model discovery failed");
+                Ok(self.fallback_models())
             }
         }
     }
@@ -629,7 +672,7 @@ impl CodexHarness {
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
+                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
             } else {
                 HarnessError::Io(e)
             }
@@ -1076,8 +1119,8 @@ async fn run_session(session: Session) {
                         } else {
                             Phase::Completed
                         };
-                        let item = params.get("item").cloned().unwrap_or(Value::Null);
-                        if matches!(item_type(&item), "agentMessage" | "agent_message") {
+                        let item = params.get("item").unwrap_or(&Value::Null);
+                        if matches!(item_type(item), "agentMessage" | "agent_message") {
                             if phase == Phase::Completed {
                                 // Fallback for non-streamed messages only.
                                 let id = item.get("id").and_then(Value::as_str).unwrap_or("");
@@ -1121,7 +1164,7 @@ async fn run_session(session: Session) {
                                 }
                             }
                         } else {
-                            for ev in children.parent_item(phase, &item) {
+                            for ev in children.parent_item(phase, item) {
                                 if !send(&event_tx, ev).await {
                                     break 'main;
                                 }
@@ -1382,12 +1425,12 @@ async fn run_session(session: Session) {
                     });
                     // Escalate if the app server doesn't wind down (turn/aborted)
                     // within the grace periods: SIGTERM, then SIGKILL.
-                    if let Some(pid) = child.id() {
+                    if let Some(pid) = crate::process::signal_target(&child) {
                         escalation = Some(tokio::spawn(async move {
                             tokio::time::sleep(interrupt_grace).await;
-                            send_signal(pid, Signal::Term);
+                            send_signal(&pid, Signal::Term);
                             tokio::time::sleep(kill_grace).await;
-                            send_signal(pid, Signal::Kill);
+                            send_signal(&pid, Signal::Kill);
                         }));
                     }
                 } else {
@@ -1679,6 +1722,24 @@ use crate::{Signal, send_signal, shutdown_child};
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn current_schema_and_legacy_visibility_are_compatible() {
+        let page = json!({"data":[{"model":"current", "hidden":false, "isDefault":true,
+            "description":"Current model", "upgrade":"next", "upgradeInfo":{"retirementAt":"2026-12-01"},
+            "availabilityNux":{"message":"Available"}, "serviceTiers":["default","fast"],
+            "defaultServiceTier":"default", "inputModalities":["text","image"]}], "nextCursor":"next-page"});
+        let (models, next) = parse_model_list_page(&page);
+        assert_eq!(
+            models[0].0.description.as_deref(),
+            Some("Current model (upgrade: next)")
+        );
+        assert!(models[0].1);
+        assert_eq!(next.as_deref(), Some("next-page"));
+        assert!(!legacy_model_page(&page));
+        assert!(legacy_model_page(&json!({"data":[{"model":"old"}]})));
+        assert!(!legacy_model_page(&json!({"data":[]})));
+    }
 
     #[test]
     fn approval_questions_are_yes_no() {
