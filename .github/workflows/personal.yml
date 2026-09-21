@@ -194,6 +194,7 @@ jobs:
           $raw = Get-Content Cargo.toml -Raw
           $updated = [regex]::new('(?m)^version = "[^"]*"').Replace($raw, "version = `"$ver`"", 1)
           Set-Content -Path Cargo.toml -Value $updated -NoNewline
+          cargo metadata --format-version 1 | Out-Null
           Write-Host "personal version $ver"
       - name: package portable app
         run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/${env:GITHUB_REPOSITORY}/releases/download/personal-latest"
