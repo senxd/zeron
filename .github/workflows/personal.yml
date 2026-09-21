@@ -86,7 +86,7 @@ jobs:
           set -euo pipefail
           base=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           n=$(git rev-list --count HEAD)
-          ver="${base}.${n}"
+          ver="${base%.*}.$(( ${base##*.} * 100000 + n ))"
           awk -v ver="$ver" 'BEGIN{done=0} !done && /^version = / {sub(/"[^"]*"/, "\"" ver "\""); done=1} {print}' Cargo.toml > Cargo.toml.new
           mv Cargo.toml.new Cargo.toml
           echo "personal version $ver"
@@ -121,7 +121,7 @@ jobs:
           set -euo pipefail
           base=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           n=$(git rev-list --count HEAD)
-          ver="${base}.${n}"
+          ver="${base%.*}.$(( ${base##*.} * 100000 + n ))"
           awk -v ver="$ver" 'BEGIN{done=0} !done && /^version = / {sub(/"[^"]*"/, "\"" ver "\""); done=1} {print}' Cargo.toml > Cargo.toml.new
           mv Cargo.toml.new Cargo.toml
           echo "personal version $ver"
@@ -189,7 +189,8 @@ jobs:
         run: |
           $base = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
           $n = (git rev-list --count HEAD).Trim()
-          $ver = "$base.$n"
+          $parts = $base.Split('.')
+          $ver = "$($parts[0]).$($parts[1]).$([int]$parts[2] * 100000 + [int]$n)"
           $raw = Get-Content Cargo.toml -Raw
           $updated = [regex]::new('(?m)^version = "[^"]*"').Replace($raw, "version = `"$ver`"", 1)
           Set-Content -Path Cargo.toml -Value $updated -NoNewline
@@ -222,7 +223,7 @@ jobs:
           set -euo pipefail
           base=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           n=$(git rev-list --count HEAD)
-          ver="${base}.${n}"
+          ver="${base%.*}.$(( ${base##*.} * 100000 + n ))"
           ls dist/
           for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
               macos-arm64.dmg macos-arm64-app.tar.gz \
