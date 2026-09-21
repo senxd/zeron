@@ -11806,6 +11806,7 @@ dependencies = [
  "base64 0.22.1",
  "deser-hjson",
  "futures",
+ "glob",
  "libc",
  "reqwest",
  "semver",

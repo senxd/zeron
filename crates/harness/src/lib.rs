@@ -114,6 +114,9 @@ pub trait Harness: Send + Sync {
             source: "live",
         })
     }
+    async fn models_for_cwd(&self, _cwd: Option<&str>) -> Result<Vec<Model>, HarnessError> {
+        self.models().await
+    }
     /// Slash commands the agent advertises (ACP `availableCommands`); empty
     /// for harnesses without them. May spawn a short-lived discovery process.
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {

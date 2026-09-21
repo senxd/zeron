@@ -423,6 +423,7 @@ const NO_ACTIVE_ROW: usize = usize::MAX;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ModelRail {
     Favorites,
+    Loadouts,
     #[default]
     Harness,
 }
@@ -437,6 +438,7 @@ struct ModelRowsKey {
     locked: bool,
     catalog_rev: u64,
     selected: Option<String>,
+    loadout_sig: String,
 }
 
 /// One row of the model list: the model plus the harness it belongs to —
@@ -448,6 +450,7 @@ struct ModelRowData {
     harness_name: SharedString,
     model: Model,
     selected_only: bool,
+    loadout: Option<(usize, crate::settings::LoadoutSlot)>,
 }
 
 /// Which picker popover is open.
@@ -474,6 +477,10 @@ pub enum PickerKind {
 pub(crate) struct ReturnComposerFocus;
 
 impl gpui::EventEmitter<ReturnComposerFocus> for Pickers {}
+
+pub struct OpenLoadoutSettings;
+
+impl gpui::EventEmitter<OpenLoadoutSettings> for Pickers {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ModelSetting {
@@ -952,6 +959,16 @@ impl Pickers {
     }
 
     /// Outside clicks and navigation keep focus at the clicked destination.
+    pub fn is_model_menu_open(&self) -> bool {
+        self.mounted_kind() == Some(PickerKind::HarnessModel)
+    }
+
+    pub fn dismiss_model_menu(&mut self, cx: &mut Context<Self>) {
+        if self.is_model_menu_open() {
+            self.dismiss(cx);
+        }
+    }
+
     fn dismiss(&mut self, cx: &mut Context<Self>) {
         self.focus_on_mount = false;
         self.cancel_setting_hover();
@@ -1712,6 +1729,17 @@ impl Pickers {
             locked: self.harness_locked(cx),
             catalog_rev: self.catalog_rev,
             selected: self.effective_model_id(cx).map(str::to_owned),
+            loadout_sig: crate::settings::current(cx)
+                .loadout
+                .slots
+                .iter()
+                .map(|slot| {
+                    slot.as_ref()
+                        .map(|slot| format!("{:?}:{}:{}", slot.harness, slot.model, slot.label))
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
         };
         if let Some((cached_key, rows)) = self.model_rows_cache.borrow().as_ref()
             && *cached_key == key
@@ -1738,6 +1766,14 @@ impl Pickers {
             .map(|f| (f.harness, f.model.as_str()))
             .collect();
         let query = self.search.read(cx).text().trim().to_string();
+        if self.model_rail == ModelRail::Loadouts {
+            return loadout_model_rows(&query, &descriptors, &crate::settings::current(cx).loadout, |harness| {
+                self.models
+                    .get(&harness)
+                    .and_then(|l| l.ready())
+                    .map(|models| models.as_slice())
+            });
+        }
         let mut rows = scoped_model_rows(
             &query,
             self.model_rail,
@@ -1777,6 +1813,7 @@ impl Pickers {
                         harness,
                         harness_name: descriptor.name.clone().into(),
                         selected_only: true,
+                        loadout: None,
                         model: Model {
                             id: id.into(),
                             label,
@@ -1837,6 +1874,10 @@ impl Pickers {
         if row.selected_only {
             return;
         }
+        if let Some((_, slot)) = row.loadout.clone() {
+            let _ = self.apply_loadout_slot(&slot, cx);
+            return;
+        }
         if self.effective_harness(cx) != Some(row.harness) {
             if self.harness_locked(cx) {
                 return;
@@ -1844,6 +1885,48 @@ impl Pickers {
             self.pick_harness(row.harness, cx);
         }
         self.pick_model(row.model.id, cx);
+    }
+
+    pub fn apply_loadout_slot(
+        &mut self,
+        slot: &crate::settings::LoadoutSlot,
+        cx: &mut Context<Self>,
+    ) -> Result<(), crate::settings::ApplyLoadoutError> {
+        let chat_exists = self.harness_locked(cx);
+        let current = if chat_exists {
+            self.state
+                .read(cx)
+                .selected_chat_row()
+                .and_then(|chat| chat.config.as_ref().map(|config| config.harness))
+                .or_else(|| self.effective_harness(cx))
+        } else {
+            None
+        };
+        crate::settings::apply_loadout_gate(chat_exists, current, Some(slot))?;
+        if chat_exists {
+            let model = slot.model.clone();
+            let reasoning = slot.reasoning;
+            let options = slot.model_options.clone();
+            self.update_chat_config(cx, move |config| {
+                config.model = Some(model);
+                config.reasoning = reasoning;
+                config.model_options = options;
+            });
+        } else {
+            self.config.harness = Some(slot.harness);
+            self.config.model = Some(slot.model.clone());
+            self.config.reasoning = slot.reasoning;
+            *self.defaults.model_options_mut(slot.harness, &slot.model) = slot.model_options.clone();
+            self.defaults.harness = Some(slot.harness);
+            self.defaults
+                .remember_model(slot.harness, slot.model.clone(), slot.label.clone());
+            self.defaults.reasoning = slot.reasoning;
+            self.save_defaults();
+            self.ensure_models(slot.harness, false, cx);
+            self.active = self.selected_model_index(cx);
+        }
+        cx.notify();
+        Ok(())
     }
 
     /// Star/unstar a model and persist it with the sticky defaults.
@@ -3377,6 +3460,7 @@ impl Pickers {
         let query = self.search.read(cx).text().trim().to_string();
         let searching = !query.is_empty();
         let favorites_view = self.model_rail == ModelRail::Favorites;
+        let loadouts_view = self.model_rail == ModelRail::Loadouts;
         let descriptors = self.rail_descriptors(cx);
         // No-agents empty state: the catalog loaded but offers nothing
         // runnable (every enabled harness is missing its CLI, or nothing is
@@ -3465,9 +3549,43 @@ impl Pickers {
                 )
                 .when(favorites_view, |el| el.child(tab_indicator(theme.accent))),
         );
+        tabs = tabs.child(
+            div()
+                .id("model-tab-loadouts")
+                .relative()
+                .w(px(32.0))
+                .h(px(32.0))
+                .rounded(px(8.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .when(!loadouts_view, |el| {
+                    el.hover(|s| s.bg(crate::theme::ink(0.06)))
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.setting_menu = None;
+                    this.model_rail = ModelRail::Loadouts;
+                    this.active = this.selected_model_index(cx);
+                    this.model_scroll_base().set_offset(gpui::Point::default());
+                    this.model_scroll
+                        .scroll_to_item(this.active, gpui::ScrollStrategy::Nearest);
+                    cx.notify();
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::WIDGET)
+                        .size(px(15.0))
+                        .text_color(if loadouts_view {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        }),
+                )
+                .when(loadouts_view, |el| el.child(tab_indicator(theme.accent))),
+        );
         for (ix, descriptor) in descriptors.iter().enumerate() {
             let harness = descriptor.id;
-            let is_viewed = !favorites_view && effective == Some(harness);
+            let is_viewed = !favorites_view && !loadouts_view && effective == Some(harness);
             let is_disabled = locked && effective != Some(harness);
             let (icon_path, tint) = harness_brand_icon(harness);
             tabs =
@@ -3707,6 +3825,19 @@ impl Pickers {
             .filter(|d| !d.is_empty() && !d.eq_ignore_ascii_case(harness_name.as_ref()))
             .map(|d| SharedString::from(d.to_owned()));
         let compact = self.model_rail == ModelRail::Harness;
+        let loadout_combo = row.loadout.as_ref().and_then(|(index, _)| {
+            crate::settings::current(cx)
+                .loadout
+                .slot(*index)
+                .and_then(|_| {
+                    crate::settings::current(cx)
+                        .loadout
+                        .resolved_combos()
+                        .get(*index)
+                        .cloned()
+                })
+                .filter(|combo| !combo.is_empty())
+        });
         let mut el = div()
             .id(("model-row", ix))
             .px(px(8.0))
@@ -3831,7 +3962,12 @@ impl Pickers {
                 this.activate_model_index(ix, cx);
             }))
             .child(body);
-        if ix < 9 {
+        if let Some(combo) = loadout_combo {
+            el = el.child(popover::kbd_hint(
+                &theme,
+                &crate::settings::badge_combo(&combo),
+            ));
+        } else if ix < 9 {
             el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
         }
         el = el.child(
@@ -4305,10 +4441,12 @@ fn scoped_model_rows<'a>(
         harness_name: SharedString::from(descriptor.name.clone()),
         model: model.clone(),
         selected_only: false,
+        loadout: None,
     };
     let in_scope = |descriptor: &HarnessDescriptor, model: &Model| match rail {
         ModelRail::Favorites => is_favorite(descriptor.id, &model.id),
         ModelRail::Harness => Some(descriptor.id) == effective,
+        ModelRail::Loadouts => false,
     };
     if !query.is_empty() {
         // Rank: label prefix < label substring < description hit; stars,
@@ -4377,7 +4515,54 @@ fn scoped_model_rows<'a>(
                 .map(|model| row(descriptor, model))
                 .collect()
         }
+        ModelRail::Loadouts => Vec::new(),
     }
+}
+
+fn loadout_model_rows<'a>(
+    query: &str,
+    descriptors: &[HarnessDescriptor],
+    loadout: &crate::settings::LoadoutConfig,
+    models_for: impl Fn(HarnessId) -> Option<&'a [Model]>,
+) -> Vec<ModelRowData> {
+    let mut rows: Vec<(usize, usize, ModelRowData)> = loadout
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(slot_index, slot)| {
+            let slot = slot.as_ref()?;
+            let descriptor = descriptors.iter().find(|d| d.id == slot.harness)?;
+            let model = models_for(slot.harness)
+                .and_then(|models| models.iter().find(|model| model.id == slot.model))
+                .cloned()
+                .unwrap_or_else(|| Model {
+                    id: slot.model.clone(),
+                    label: slot.label.clone(),
+                    description: None,
+                    reasoning_levels: slot.reasoning.into_iter().collect(),
+                    options: Vec::new(),
+                });
+            let haystack = format!("{} {} {}", slot.label, slot.model, descriptor.name);
+            let rank = if query.is_empty() {
+                0
+            } else {
+                popover::match_rank(query, &haystack)?
+            };
+            Some((
+                rank,
+                slot_index,
+                ModelRowData {
+                    harness: slot.harness,
+                    harness_name: SharedString::from(descriptor.name.clone()),
+                    model,
+                    selected_only: false,
+                    loadout: Some((slot_index, slot.clone())),
+                },
+            ))
+        })
+        .collect();
+    rows.sort_by_key(|(rank, slot, _)| (*rank, *slot));
+    rows.into_iter().map(|(_, _, row)| row).collect()
 }
 
 /// Centered muted note filling an empty model list ("No models found").

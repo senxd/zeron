@@ -94,6 +94,8 @@ struct ListModelsParams {
     harness: HarnessId,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1407,9 +1409,12 @@ impl RpcService for EngineRpc {
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let models = crate::model_catalogs::list(self.repos.data_dir(), harness, p.force)
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let models = if p.harness == zeron_proto::HarnessId::Pi && p.cwd.is_some() {
+                    harness.models_for_cwd(p.cwd.as_deref()).await
+                } else {
+                    crate::model_catalogs::list(self.repos.data_dir(), harness, p.force).await
+                }
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
             methods::LIST_COMMANDS => {

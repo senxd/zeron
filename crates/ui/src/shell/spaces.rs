@@ -1890,6 +1890,7 @@ enum SidebarViewRow {
     ShowBranch,
     ShowPullRequest,
     ShowHarness,
+    ShowArchive,
 }
 
 impl SidebarViewRow {
@@ -1904,9 +1905,9 @@ impl SidebarViewRow {
 }
 
 const SIDEBAR_VIEW_GROUPS: [(&str, std::ops::Range<usize>); 3] =
-    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..10)];
+    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..11)];
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 10] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 11] = [
     SidebarViewRow::ByDevice,
     SidebarViewRow::ByProject,
     SidebarViewRow::InOneList,
@@ -1917,6 +1918,7 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 10] = [
     SidebarViewRow::ShowHarness,
     SidebarViewRow::ShowProjectIcon,
     SidebarViewRow::ShowProjectLabel,
+    SidebarViewRow::ShowArchive,
 ];
 
 // list items stay tightly related at 2px, while section boundaries use 12px
@@ -3116,6 +3118,9 @@ impl Shell {
             SidebarViewRow::ShowHarness => {
                 self.settings.sidebar_show_harness = !self.settings.sidebar_show_harness
             }
+            SidebarViewRow::ShowArchive => {
+                self.settings.sidebar_show_archive = !self.settings.sidebar_show_archive
+            }
         }
         self.schedule_save(cx);
         if row.closes_submenu() {
@@ -3285,6 +3290,7 @@ impl Shell {
             "Harness",
             "Project icon",
             "Location",
+            "Archive",
         ];
         let icons = [
             icons::LAPTOP,
@@ -3297,6 +3303,7 @@ impl Shell {
             icons::BOT,
             icons::PROJECT_DEFAULT,
             icons::FOLDER,
+            icons::ARCHIVE_MINIMALISTIC,
         ];
         let selected = [
             organization == SidebarOrganization::ByDevice,
@@ -3309,6 +3316,7 @@ impl Shell {
             show_harness,
             self.settings.sidebar_show_project_icon,
             self.settings.sidebar_show_project_label,
+            self.settings.sidebar_show_archive,
         ];
         let values = [
             labels[selected[..3].iter().position(|v| *v).unwrap_or(0)].to_string(),
@@ -4636,6 +4644,7 @@ impl Shell {
                     } else {
                         this.sidebar_collapsed_groups.remove(&toggle_key);
                     }
+                    this.persist_sidebar_disclosure(cx);
                     cx.notify();
                 }));
             let body = self.render_sidebar_disclosure_body(
@@ -4716,6 +4725,7 @@ impl Shell {
                     if was_open { 0.0 } else { body_height },
                 );
                 this.pinned_open = !was_open;
+                this.persist_sidebar_disclosure(cx);
                 // The disclosure owns this movement; avoid a second FLIP
                 // animation on the regular sessions below it.
                 this.sidebar_prev_order.clear();
@@ -4795,6 +4805,7 @@ impl Shell {
                     if was_open { 0.0 } else { body_height },
                 );
                 this.sessions_open = !was_open;
+                this.persist_sidebar_disclosure(cx);
                 this.sidebar_prev_order.clear();
                 this.sidebar_resort.clear();
                 this.sidebar_new_keys.clear();
@@ -4907,6 +4918,7 @@ impl Shell {
                     if was_open { 0.0 } else { body_height },
                 );
                 this.archived_open = !was_open;
+                this.persist_sidebar_disclosure(cx);
                 this.archived_shown = INITIAL;
                 cx.notify();
             }));

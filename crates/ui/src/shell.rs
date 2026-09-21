@@ -41,14 +41,15 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
+use crate::settings::loadout::{LoadoutEvent, LoadoutPage};
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    self, CHAT_PANEL_MIN, ComposerSendBehavior, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT,
-    RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
-    SidebarOrganization, SidebarSort, TERMINAL_DEFAULT_HEIGHT, TERMINAL_MAX_VH,
-    TERMINAL_MIN_HEIGHT, UiSettings, badge_combo, jump_hints_visible, modifier_send_hint_visible,
-    platform_combo, sidebar_pin_profile_key,
+    self, CHAT_PANEL_MIN, ComposerSendBehavior, JUMP_SLOTS, KeymapConfig, LOADOUT_SLOTS,
+    LoadoutConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN,
+    SavePolicy, ShortcutId, SidebarOrganization, SidebarSort, TERMINAL_DEFAULT_HEIGHT,
+    TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT, UiSettings, apply_loadout_error_message, badge_combo,
+    jump_hints_visible, modifier_send_hint_visible, platform_combo, sidebar_pin_profile_key,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -56,6 +57,7 @@ use crate::state::{
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
+use crate::toast::{self, Toast, ToastKind};
 use crate::transcript::{self, Transcript, TranscriptEvent};
 use crate::workspace_links::resolve_workspace_file_link;
 
@@ -219,6 +221,11 @@ fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f
 #[action(namespace = shell, no_json)]
 pub struct JumpSession(pub usize);
 
+/// Activate loadout slot `n` (zero-based) via the shared prefix + 1–N.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = shell, no_json)]
+pub struct ActivateLoadout(pub usize);
+
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
 // ---------------------------------------------------------------------------
@@ -306,6 +313,8 @@ pub fn apply_keymap(
     cx: &mut App,
     keymap: &KeymapConfig,
     composer_send_behavior: ComposerSendBehavior,
+    loadout: &LoadoutConfig,
+    bind_loadout: bool,
 ) {
     fn valid_or_default(combo: &str, fallback: &str) -> String {
         let candidate = platform_combo(combo);
@@ -409,6 +418,37 @@ pub fn apply_keymap(
             None,
         ))
     }));
+    if bind_loadout {
+        let mut bindings = Vec::new();
+        for slot in 0..LOADOUT_SLOTS {
+            let combo = loadout.combo(slot);
+            if combo.is_empty()
+                || crate::settings::loadout_model::loadout_shortcut_conflict(
+                    cfg!(target_os = "macos"),
+                    keymap,
+                    loadout,
+                    slot,
+                    &combo,
+                )
+                .is_some()
+            {
+                continue;
+            }
+            let mut candidates = vec![combo.clone()];
+            // X11 reports Ctrl+Shift+1 as ctrl-! (shift dropped for symbols)
+            // just like macOS, so the symbol alias must bind everywhere.
+            if let Some(alias) = crate::settings::loadout_model::loadout_symbol_alias(&combo) {
+                candidates.push(alias);
+            }
+            for combo in candidates {
+                let candidate = platform_combo(&combo);
+                if Keystroke::parse(&candidate).is_ok() {
+                    bindings.push(KeyBinding::new(&candidate, ActivateLoadout(slot), None));
+                }
+            }
+        }
+        cx.bind_keys(bindings);
+    }
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
@@ -417,6 +457,8 @@ pub enum SettingsSection {
     Devices,
     /// Which harnesses the composer offers (enable/disable toggles).
     Harnesses,
+    /// Five-slot composer loadout (drag models, Cmd+Shift+1–N).
+    Loadout,
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
     Appearance,
@@ -428,9 +470,10 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
+        SettingsSection::Loadout,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Files,
@@ -446,6 +489,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Devices => "Devices",
             SettingsSection::Harnesses => "Agents",
+            SettingsSection::Loadout => "Model Loadout",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
@@ -1544,6 +1588,12 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
+    loadout_page: Option<Entity<LoadoutPage>>,
+    loadout_sub: Option<Subscription>,
+    loadout_recording: bool,
+    toast: Option<Toast>,
+    toast_seq: u64,
+    toast_task: Option<Task<()>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     files_settings_sub: Option<Subscription>,
@@ -1757,6 +1807,9 @@ impl Shell {
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
             move |this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+                ComposerEvent::OpenLoadoutSettings => {
+                    this.open_settings(SettingsSection::Loadout, cx)
+                }
                 ComposerEvent::NewThreadTransitionStarted => {
                     // Route observation drives the dock once selection commits.
                     cx.notify();
@@ -1835,7 +1888,13 @@ impl Shell {
         crate::appshots::set_enabled(settings.appshots_enabled);
         crate::appshots::set_capture_sound_enabled(settings.appshot_sound_enabled);
         // Bind the customizable shortcuts from the persisted keymap.
-        apply_keymap(cx, &settings.keymap, settings.composer_send_behavior);
+        apply_keymap(
+            cx,
+            &settings.keymap,
+            settings.composer_send_behavior,
+            &settings.loadout,
+            true,
+        );
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
         // synthetic input can't reach them on headless compositors.
@@ -1845,6 +1904,9 @@ impl Shell {
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
+            Some("settings/models") | Some("settings/loadout") => {
+                Route::Settings(SettingsSection::Loadout)
+            }
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
@@ -1900,11 +1962,11 @@ impl Shell {
             bottom_stack_has_composer: std::rc::Rc::new(std::cell::Cell::new(false)),
             composer_dock: Default::default(),
             new_thread_artwork_ready: Default::default(),
-            archived_open: true,
-            pinned_open: true,
-            sessions_open: true,
+            archived_open: settings.sidebar_archived_open,
+            pinned_open: settings.sidebar_pinned_open,
+            sessions_open: settings.sidebar_sessions_open,
             archived_shown: 0,
-            sidebar_collapsed_groups: std::collections::HashSet::new(),
+            sidebar_collapsed_groups: settings.sidebar_collapsed_groups.iter().cloned().collect(),
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
             terminal: None,
@@ -1943,6 +2005,12 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
+            loadout_page: None,
+            loadout_sub: None,
+            loadout_recording: false,
+            toast: None,
+            toast_seq: 0,
+            toast_task: None,
             shortcuts_sub: None,
             notifications_sub: None,
             files_settings_sub: None,
@@ -3685,6 +3753,15 @@ impl Shell {
         cx.notify();
     }
 
+    pub(super) fn persist_sidebar_disclosure(&mut self, cx: &mut Context<Self>) {
+        self.settings.sidebar_pinned_open = self.pinned_open;
+        self.settings.sidebar_sessions_open = self.sessions_open;
+        self.settings.sidebar_archived_open = self.archived_open;
+        self.settings.sidebar_collapsed_groups =
+            self.sidebar_collapsed_groups.iter().cloned().collect();
+        self.schedule_save(cx);
+    }
+
     /// Publish this view's working copy to the central settings store. The
     /// store owns the single debounce task and the only production writer.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
@@ -3808,6 +3885,14 @@ impl Shell {
         if section == SettingsSection::Harnesses {
             self.harnesses_page = None;
         }
+        if section != SettingsSection::Loadout && self.loadout_recording {
+            self.loadout_recording = false;
+            self.rebind_keys(cx);
+        }
+        if section == SettingsSection::Loadout {
+            self.loadout_page = None;
+            self.loadout_sub = None;
+        }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
         self.close_user_menu(cx);
@@ -3816,6 +3901,10 @@ impl Shell {
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
+        if self.loadout_recording {
+            self.loadout_recording = false;
+            self.rebind_keys(cx);
+        }
         self.route = Route::Chat;
         self.focus_composer(cx);
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
@@ -3883,6 +3972,45 @@ impl Shell {
                     self.harnesses_page = Some(cx.new(|cx| HarnessesPage::new(state, cx)));
                 }
                 match &self.harnesses_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Loadout => {
+                if self.loadout_page.is_none() {
+                    let state = self.state.clone();
+                    let loadout = self.settings.loadout.clone();
+                    let keymap = self.settings.keymap.clone();
+                    let page = cx.new(|cx| LoadoutPage::new(state, loadout, keymap, cx));
+                    self.loadout_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &LoadoutEvent, cx| match event {
+                            LoadoutEvent::Changed(loadout) => {
+                                this.settings.loadout = loadout.clone();
+                                if let Some(page) = &this.shortcuts_page {
+                                    let loadout = loadout.clone();
+                                    page.update(cx, |page, cx| page.set_loadout(loadout, cx));
+                                }
+                                this.rebind_keys(cx);
+                                this.schedule_save(cx);
+                                cx.notify();
+                            }
+                            LoadoutEvent::RecordingChanged(recording) => {
+                                this.loadout_recording = *recording;
+                                this.rebind_keys(cx);
+                                cx.notify();
+                            }
+                            LoadoutEvent::OpenAgents => {
+                                this.open_settings(SettingsSection::Harnesses, cx);
+                            }
+                        },
+                    ));
+                    self.loadout_page = Some(page);
+                } else if let Some(page) = &self.loadout_page {
+                    let keymap = self.settings.keymap.clone();
+                    page.update(cx, |page, cx| page.set_keymap(keymap, cx));
+                }
+                match &self.loadout_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -4026,6 +4154,7 @@ impl Shell {
                             keymap,
                             escape_stops_active_agent,
                             composer_send_behavior,
+                            self.settings.loadout.clone(),
                             appshots_enabled,
                             appshot_sound_enabled,
                             appshot_destination,
@@ -4062,6 +4191,8 @@ impl Shell {
                                 cx,
                                 &this.settings.keymap,
                                 this.settings.composer_send_behavior,
+                                &this.settings.loadout,
+                                !this.loadout_recording,
                             );
                             this.schedule_save(cx);
                             cx.notify();
@@ -4386,6 +4517,99 @@ impl Shell {
             || self.section_menu.is_some()
             || self.add_space.is_some()
             || self.composer.read(cx).pickers().read(cx).is_open()
+    }
+
+    fn rebind_keys(&self, cx: &mut App) {
+        apply_keymap(
+            cx,
+            &self.settings.keymap,
+            self.settings.composer_send_behavior,
+            &self.settings.loadout,
+            !self.loadout_recording,
+        );
+    }
+
+    fn push_toast(
+        &mut self,
+        kind: ToastKind,
+        message: impl Into<gpui::SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.toast_seq += 1;
+        let id = self.toast_seq;
+        self.toast = Some(Toast::new(id, kind, message));
+        self.toast_task = Some(toast::dismiss_after(
+            id,
+            cx,
+            move |this| {
+                let Some(toast) = this.toast.as_mut() else {
+                    return false;
+                };
+                if toast.id != id {
+                    return false;
+                }
+                toast.begin_close();
+                true
+            },
+            move |this| {
+                if this.toast.as_ref().is_some_and(|toast| toast.id == id) {
+                    this.toast = None;
+                }
+            },
+        ));
+        cx.notify();
+    }
+
+    fn activate_loadout(&mut self, slot: usize, cx: &mut Context<Self>) {
+        if self.loadout_recording {
+            return;
+        }
+        let Some(slot) = self.settings.loadout.slot(slot).cloned() else {
+            self.push_toast(ToastKind::Warning, "That loadout slot is empty.", cx);
+            return;
+        };
+        let result = self.composer.update(cx, |composer, cx| {
+            composer
+                .pickers()
+                .update(cx, |pickers, cx| pickers.apply_loadout_slot(&slot, cx))
+        });
+        if let Err(error) = result {
+            self.push_toast(ToastKind::Error, apply_loadout_error_message(&error), cx);
+        }
+    }
+
+    fn render_toast_overlay(
+        &mut self,
+        sidebar: f32,
+        right: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(toast) = self.toast.clone() else {
+            return Empty.into_any_element();
+        };
+        if toast.is_finished() {
+            self.toast = None;
+            return Empty.into_any_element();
+        }
+        let theme = Theme::of(cx).clone();
+        let entity = cx.entity();
+        div()
+            .absolute()
+            .top(px(Theme::TITLEBAR_HEIGHT + 10.0))
+            .left(px(sidebar))
+            .right(px(right))
+            .flex()
+            .justify_center()
+            .occlude()
+            .child(toast::render_toast(&toast, &theme, move |_, _, cx| {
+                entity.update(cx, |this, cx| {
+                    if let Some(toast) = this.toast.as_mut() {
+                        toast.begin_close();
+                    }
+                    cx.notify();
+                });
+            }))
+            .into_any_element()
     }
 
     /// Track held modifiers for sidebar jump hints and the queue's submit hint.
@@ -5727,6 +5951,7 @@ impl Shell {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Harnesses => icons::WIDGET,
+            SettingsSection::Loadout => icons::STAR,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER,
@@ -5893,6 +6118,7 @@ impl Shell {
         let project_icon = (search_query.is_none() && self.settings.sidebar_show_project_icon)
             .then(|| self.render_project_icon(&id, SIDEBAR_ACTIVE_HARNESS_ICON_SIZE, selected, cx));
         let corner_hovered = !preview && self.chat_status_hover.as_deref() == Some(row_id.as_str());
+        let show_archive_button = corner_hovered && self.settings.sidebar_show_archive;
         let archived_muted = archived && search_query.is_none() && !selected && !corner_hovered;
         let project_icon = project_icon.map(|icon| {
             div()
@@ -6000,7 +6226,7 @@ impl Shell {
                     .child(label)
                     .into_any_element()
             }
-        } else if corner_hovered {
+        } else if show_archive_button {
             div()
                 .flex()
                 .flex_row()
@@ -6110,7 +6336,7 @@ impl Shell {
             let archive_id = id.clone();
             div()
                 .id(SharedString::from(format!("{row_id}-corner")))
-                .aria_label(if corner_hovered {
+                .aria_label(if show_archive_button {
                     if archived { "Unarchive" } else { "Archive" }
                 } else {
                     if compact {
@@ -6137,7 +6363,7 @@ impl Shell {
                 .flex()
                 .items_center()
                 .when(!preview, |el| el.cursor_pointer())
-                .when(corner_hovered, |el| {
+                .when(show_archive_button, |el| {
                     el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
@@ -10678,17 +10904,20 @@ impl Render for Shell {
                 }
             }))
             // A jump routes back to chat itself, so Settings is not a dead
-            // spot — the same call a click on that sidebar row makes. But an
-            // open picker/palette owns the keyboard: no jumping underneath
-            // it. The MODEL menu advertises these same slots on its rows and
-            // this matched binding beats its key handler to the dispatch —
-            // forward the slot instead of eating it.
+            // spot. The model menu preserves these existing chat shortcuts;
+            // other overlays keep ownership of the keyboard.
             .on_action(cx.listener(|this, jump: &JumpSession, _, cx| {
                 let pickers = this.composer.read(cx).pickers().clone();
-                let handled = pickers.update(cx, |pickers, cx| pickers.jump_model_slot(jump.0, cx));
-                if !handled && !this.overlay_owns_keyboard(cx) {
+                let model_menu_open = pickers.read(cx).is_model_menu_open();
+                if model_menu_open || !this.overlay_owns_keyboard(cx) {
+                    if model_menu_open {
+                        pickers.update(cx, |pickers, cx| pickers.dismiss_model_menu(cx));
+                    }
                     this.jump_to_session(jump.0, cx)
                 }
+            }))
+            .on_action(cx.listener(|this, action: &ActivateLoadout, _, cx| {
+                this.activate_loadout(action.0, cx);
             }))
             .on_modifiers_changed(
                 cx.listener(|this, event, _, cx| this.on_modifiers_changed(event, cx)),
@@ -10983,7 +11212,16 @@ impl Render for Shell {
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
                     .child(self.render_titlebar_cluster(cx))
-                    .children(overlays);
+                    .children(overlays)
+                    .child(self.render_toast_overlay(
+                        sidebar_now,
+                        if right_open {
+                            self.eval_tween(self.right_tween, self.right_target(cx))
+                        } else {
+                            0.0
+                        },
+                        cx,
+                    ));
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
             }
@@ -12451,7 +12689,7 @@ mod exit_regressions {
     }
 
     #[gpui::test]
-    fn session_navigation_focuses_composer_once(cx: &mut TestAppContext) {
+    fn composer_routes_loadout_event_and_focuses_once(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             gpui_base::init(cx);
@@ -12489,6 +12727,17 @@ mod exit_regressions {
             cx.open_window(gpui::WindowOptions::default(), |_, _| composer)
                 .unwrap()
         });
+        let pickers = cx.update(|cx| window.read(cx).unwrap().composer.read(cx).pickers().clone());
+        pickers.update(cx, |_, cx| cx.emit(crate::pickers::OpenLoadoutSettings));
+        window
+            .update(cx, |shell, _, cx| {
+                assert!(matches!(
+                    shell.route,
+                    Route::Settings(SettingsSection::Loadout)
+                ));
+                shell.close_settings(cx);
+            })
+            .unwrap();
         for destination in ["initial", "chat", "chat", "new", "new", "back", "settings"] {
             window
                 .update(cx, |shell, _, cx| match destination {
@@ -13294,6 +13543,7 @@ mod shortcut_focus_regressions {
         editor: FocusHandle,
         show_editor: bool,
         jumps: usize,
+        loadouts: usize,
     }
 
     impl Render for ShortcutHost {
@@ -13323,6 +13573,7 @@ mod shortcut_focus_regressions {
                     }),
                 )
                 .on_action(cx.listener(|this, _: &JumpSession, _, _| this.jumps += 1))
+                .on_action(cx.listener(|this, _: &ActivateLoadout, _, _| this.loadouts += 1))
                 .when(self.show_editor, |el| {
                     el.child(div().track_focus(&self.editor))
                 })
@@ -13337,6 +13588,7 @@ mod shortcut_focus_regressions {
             editor: cx.focus_handle(),
             show_editor: true,
             jumps: 0,
+            loadouts: 0,
         });
         cx.run_until_parked();
         cx.update_window(host.into(), |_, window, cx| window.draw(cx).clear())
@@ -13368,6 +13620,7 @@ mod shortcut_focus_regressions {
             editor: cx.focus_handle(),
             show_editor: true,
             jumps: 0,
+            loadouts: 0,
         });
         for show_editor in [true, false, true, false] {
             host.update(cx, |host, window, cx| {
@@ -13412,6 +13665,7 @@ mod shortcut_focus_regressions {
             editor: cx.focus_handle(),
             show_editor: true,
             jumps: 0,
+            loadouts: 0,
         });
         for (index, x) in [50.0, 150.0, 250.0, 50.0, 150.0, 250.0]
             .into_iter()
@@ -13444,6 +13698,139 @@ mod shortcut_focus_regressions {
             })
             .unwrap();
         }
+    }
+
+    struct LoadoutShortcutHost {
+        focus: FocusHandle,
+        activated: Vec<usize>,
+    }
+
+    impl Render for LoadoutShortcutHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().track_focus(&self.focus).on_action(
+                cx.listener(|this, event: &ActivateLoadout, _, _| this.activated.push(event.0)),
+            )
+        }
+    }
+
+    #[gpui::test]
+    fn custom_loadout_shortcut_dispatches_after_reorder_and_clear(cx: &mut TestAppContext) {
+        let mut loadout = LoadoutConfig::default();
+        for (index, model) in ["one", "two"].into_iter().enumerate() {
+            loadout.slots[index] = Some(crate::settings::LoadoutSlot {
+                harness: zeron_proto::HarnessId::Codex,
+                model: model.into(),
+                label: model.into(),
+                reasoning: None,
+                model_options: Default::default(),
+                shortcut: (index == 0).then(|| "mod-shift-h".into()),
+            });
+        }
+        cx.update(|cx| {
+            apply_keymap(
+                cx,
+                &KeymapConfig::default(),
+                ComposerSendBehavior::default(),
+                &loadout,
+                true,
+            )
+        });
+        let host = cx.add_window(|_, cx| LoadoutShortcutHost {
+            focus: cx.focus_handle(),
+            activated: Vec::new(),
+        });
+        host.update(cx, |host, window, cx| window.focus(&host.focus, cx))
+            .unwrap();
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-h"));
+        host.update(cx, |host, _, _| assert_eq!(host.activated, vec![0]))
+            .unwrap();
+        loadout.reorder(0, 1);
+        cx.update(|cx| {
+            apply_keymap(
+                cx,
+                &KeymapConfig::default(),
+                ComposerSendBehavior::default(),
+                &loadout,
+                true,
+            )
+        });
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-h"));
+        host.update(cx, |host, _, _| assert_eq!(host.activated, vec![0, 1]))
+            .unwrap();
+        {
+            loadout.slots[1].as_mut().unwrap().shortcut = Some("mod-shift-1".into());
+            cx.update(|cx| {
+                apply_keymap(
+                    cx,
+                    &KeymapConfig::default(),
+                    ComposerSendBehavior::default(),
+                    &loadout,
+                    true,
+                )
+            });
+            // The OS drops shift for symbol keys, so the chord arrives as
+            // mod-! on every platform, not just macOS.
+            cx.simulate_keystrokes(host.into(), &platform_combo("mod-!"));
+            host.update(cx, |host, _, _| {
+                assert_eq!(host.activated, vec![0, 1, 1]);
+                host.activated.pop();
+            })
+            .unwrap();
+        }
+        loadout.slots[1].as_mut().unwrap().shortcut = Some(String::new());
+        cx.update(|cx| {
+            apply_keymap(
+                cx,
+                &KeymapConfig::default(),
+                ComposerSendBehavior::default(),
+                &loadout,
+                true,
+            )
+        });
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-h"));
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-shift-2"));
+        host.update(cx, |host, _, _| assert_eq!(host.activated, vec![0, 1]))
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn loadout_and_chat_number_shortcuts_dispatch_distinct_actions(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            apply_keymap(
+                cx,
+                &KeymapConfig::default(),
+                ComposerSendBehavior::default(),
+                &LoadoutConfig::default(),
+                true,
+            );
+        });
+        let host = cx.add_window(|_, cx| ShortcutHost {
+            root: cx.focus_handle(),
+            unfocused: cx.focus_handle(),
+            editor: cx.focus_handle(),
+            show_editor: true,
+            jumps: 0,
+            loadouts: 0,
+        });
+        host.update(cx, |host, window, cx| window.focus(&host.editor, cx))
+            .unwrap();
+
+        cx.simulate_keystrokes(host.into(), &platform_combo("mod-1"));
+        // Shifted digits arrive as the bare symbol with the shift flag
+        // dropped on macOS AND X11 — the alias binding dispatches everywhere.
+        for slot in 0..LOADOUT_SLOTS {
+            let alias = crate::settings::loadout_model::loadout_symbol_alias(
+                &crate::settings::loadout_combo(crate::settings::DEFAULT_LOADOUT_PREFIX, slot),
+            )
+            .unwrap();
+            cx.simulate_keystrokes(host.into(), &platform_combo(&alias));
+        }
+
+        host.update(cx, |host, _, _| {
+            assert_eq!(host.jumps, 1);
+            assert_eq!(host.loadouts, 5);
+        })
+        .unwrap();
     }
 }
 

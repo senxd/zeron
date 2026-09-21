@@ -23,9 +23,16 @@ pub mod composer;
 pub mod devices;
 pub mod files;
 pub mod harnesses;
+pub mod loadout;
+pub mod loadout_model;
 pub mod notifications;
 pub mod shortcuts;
 pub mod widgets;
+
+pub use loadout_model::{
+    ApplyLoadoutError, DEFAULT_LOADOUT_PREFIX, LOADOUT_SLOTS, LoadoutConfig, LoadoutSlot,
+    apply_loadout_error_message, apply_loadout_gate, loadout_combo,
+};
 
 /// Sidebar drag-resize bounds (px).
 pub const SIDEBAR_MIN: f32 = 224.0;
@@ -616,6 +623,12 @@ pub struct UiSettings {
     pub composer_send_behavior: ComposerSendBehavior,
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
+    pub sidebar_show_archive: bool,
+    pub sidebar_pinned_open: bool,
+    pub sidebar_sessions_open: bool,
+    pub sidebar_archived_open: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidebar_collapsed_groups: Vec<String>,
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
     /// folder inherently). Kept for file compatibility; no longer read.
     pub sidebar_grouped: bool,
@@ -688,6 +701,8 @@ pub struct UiSettings {
     pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
+    /// Composer loadout slots with per-entry activation shortcuts.
+    pub loadout: LoadoutConfig,
     /// macOS viewer-side Appshot capture. Device-local because the shortcut
     /// and TCC permissions belong to this desktop.
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), serde(skip))]
@@ -763,6 +778,11 @@ impl Default for UiSettings {
             window_geometry: None,
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
+            sidebar_show_archive: true,
+            sidebar_pinned_open: true,
+            sidebar_sessions_open: true,
+            sidebar_archived_open: true,
+            sidebar_collapsed_groups: Vec::new(),
             sidebar_grouped: false,
             sidebar_organization: SidebarOrganization::InOneList,
             sidebar_sort: SidebarSort::LastUpdated,
@@ -792,6 +812,7 @@ impl Default for UiSettings {
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
+            loadout: LoadoutConfig::default(),
             escape_stops_active_agent: false,
             composer_send_behavior: ComposerSendBehavior::default(),
             appshots_enabled: false,
@@ -1126,14 +1147,40 @@ impl KeymapConfig {
         }
     }
 
-    /// Cmd/Ctrl+Enter belongs to the composer on every send mode. Older
-    /// settings could assign it to an app shortcut while plain Enter was the
-    /// configured sender; restore only those newly-conflicting rows to their
-    /// defaults and preserve every unrelated customization.
-    fn heal_reserved_composer_shortcuts(&mut self) {
+    /// Restore persisted shortcuts that collide with fixed app bindings.
+    fn heal_reserved_shortcuts(&mut self, loadout: &LoadoutConfig) {
         for id in ShortcutId::ALL {
-            if self.get(id) == "mod-enter" {
-                self.reset(id);
+            if platform_combo(self.get(id)) == platform_combo("mod-enter")
+                || loadout_model::loadout_shortcut_owner(
+                    cfg!(target_os = "macos"),
+                    loadout,
+                    usize::MAX,
+                    self.get(id),
+                )
+                .is_some()
+            {
+                let default = id.default_combo();
+                let default_is_taken = ShortcutId::ALL.into_iter().any(|other| {
+                    other != id && platform_combo(self.get(other)) == platform_combo(default)
+                }) || loadout_model::loadout_shortcut_owner(
+                    cfg!(target_os = "macos"),
+                    loadout,
+                    usize::MAX,
+                    default,
+                )
+                .is_some();
+                let healed = if default_is_taken { "" } else { default };
+                tracing::warn!(
+                    "shortcut \"{}\" on {} conflicts with a reserved chord; reset to {}",
+                    self.get(id),
+                    id.label(),
+                    if healed.is_empty() {
+                        "disabled"
+                    } else {
+                        healed
+                    }
+                );
+                self.set(id, healed.into());
             }
         }
     }
@@ -1258,6 +1305,29 @@ pub fn platform_combo_on(mac: bool, combo: &str) -> String {
         .join("-")
 }
 
+fn display_combo_parts(combo: &str) -> Vec<&str> {
+    let mut parts = if combo == "-" {
+        vec!["-"]
+    } else if let Some(modifiers) = combo.strip_suffix("--") {
+        let mut parts: Vec<_> = modifiers.split('-').collect();
+        parts.push("-");
+        parts
+    } else {
+        combo.split('-').collect()
+    };
+    // A recorded shifted digit is stored as the bare symbol (the OS drops
+    // the shift flag): show "mod-@" the way the user pressed it — Ctrl+Shift+2.
+    if let Some(digit) = parts
+        .last()
+        .and_then(|key| loadout_model::unshifted_digit(key))
+        .filter(|_| !parts[..parts.len() - 1].contains(&"shift"))
+    {
+        *parts.last_mut().unwrap() = digit;
+        parts.insert(parts.len() - 1, "shift");
+    }
+    parts
+}
+
 /// Human-readable combo for the shortcuts table ("mod-s" → "Cmd+S"/"Ctrl+S").
 pub fn display_combo(combo: &str) -> String {
     display_combo_on(cfg!(target_os = "macos"), combo)
@@ -1265,8 +1335,8 @@ pub fn display_combo(combo: &str) -> String {
 
 /// [`display_combo`] for an explicit platform (see [`combo_from_keystroke_on`]).
 pub fn display_combo_on(mac: bool, combo: &str) -> String {
-    combo
-        .split('-')
+    display_combo_parts(combo)
+        .into_iter()
         .map(|part| match part {
             "mod" => if mac { "Cmd" } else { "Ctrl" }.to_string(),
             "alt" => if mac { "Opt" } else { "Alt" }.to_string(),
@@ -1296,7 +1366,7 @@ pub fn badge_combo_on(mac: bool, combo: &str) -> String {
     if !mac {
         return display_combo_on(false, combo);
     }
-    let mut parts: Vec<&str> = combo.split('-').collect();
+    let mut parts = display_combo_parts(combo);
     let key = parts.pop().unwrap_or("");
     let mut out = String::new();
     for glyph in ["ctrl", "alt", "shift", "mod"]
@@ -1383,7 +1453,8 @@ impl UiSettings {
         self.git_history_column_order = self.git_history_column_order.normalized();
         self.ui_font_size = self.ui_font_size.normalized();
         self.keymap.heal_jump_slots();
-        self.keymap.heal_reserved_composer_shortcuts();
+        self.loadout = self.loadout.clamped();
+        self.keymap.heal_reserved_shortcuts(&self.loadout);
         self
     }
 
@@ -2021,6 +2092,11 @@ mod tests {
             window_geometry: None,
             sidebar_width: 300.0,
             sidebar_collapsed: true,
+            sidebar_show_archive: false,
+            sidebar_pinned_open: false,
+            sidebar_sessions_open: false,
+            sidebar_archived_open: false,
+            sidebar_collapsed_groups: vec!["project:demo".into()],
             sidebar_grouped: true,
             sidebar_organization: SidebarOrganization::ByDevice,
             sidebar_sort: SidebarSort::Created,
@@ -2068,6 +2144,7 @@ mod tests {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
             },
+            loadout: LoadoutConfig::default(),
             escape_stops_active_agent: true,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             appshots_enabled: false,
@@ -3032,6 +3109,55 @@ mod tests {
     }
 
     #[test]
+    fn freed_loadout_shortcut_survives_settings_reload() {
+        let mut settings = UiSettings::default();
+        settings.loadout.slots[0] = Some(LoadoutSlot {
+            harness: zeron_proto::HarnessId::Codex,
+            model: "model".into(),
+            label: "Model".into(),
+            reasoning: None,
+            model_options: Default::default(),
+            shortcut: Some("mod-shift-h".into()),
+        });
+        settings.keymap.toggle_terminal = "mod-shift-1".into();
+        let settings = settings.clamped();
+        assert_eq!(settings.keymap.toggle_terminal, "mod-shift-1");
+        let loaded: UiSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.clamped().keymap.toggle_terminal, "mod-shift-1");
+    }
+
+    #[test]
+    fn fixed_loadout_shortcuts_heal_persisted_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"keymap": {"toggleTerminal": "mod-shift-1", "toggleSidebar": "mod-shift-x"}}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            loaded.keymap.get(ShortcutId::ToggleTerminal),
+            ShortcutId::ToggleTerminal.default_combo()
+        );
+        assert_eq!(loaded.keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
+        assert!(conflicted_shortcuts(&loaded.keymap).is_empty());
+    }
+
+    #[test]
+    fn fixed_loadout_healing_does_not_recreate_a_default_conflict() {
+        let mut settings = UiSettings::default();
+        settings.keymap.toggle_sidebar = "mod-1".into();
+        settings.keymap.jump_session[0] = "mod-shift-1".into();
+
+        let loaded = settings.clamped();
+        assert_eq!(loaded.keymap.toggle_sidebar, "mod-1");
+        assert!(loaded.keymap.jump_session[0].is_empty());
+        assert!(conflicted_shortcuts(&loaded.keymap).is_empty());
+    }
+
+    #[test]
     fn jump_hints_need_an_exact_modifier_match() {
         let keymap = KeymapConfig::default();
         // Mod alone matches mod-1..9.
@@ -3064,6 +3190,28 @@ mod tests {
         assert!(!modifier_send_hint_visible(false, false, false));
         assert!(!modifier_send_hint_visible(true, true, false));
         assert!(!modifier_send_hint_visible(true, false, true));
+    }
+
+    #[test]
+    fn literal_minus_shortcut_displays_its_key() {
+        assert_eq!(display_combo_on(true, "mod--"), "Cmd+-");
+        assert_eq!(display_combo_on(false, "mod--"), "Ctrl+-");
+        assert_eq!(badge_combo_on(true, "mod--"), "⌘-");
+        assert_eq!(badge_combo_on(false, "mod--"), "Ctrl+-");
+        assert_eq!(badge_combo_on(true, "mod-shift--"), "⇧⌘-");
+    }
+
+    #[test]
+    fn recorded_symbol_keys_display_the_shifted_digit() {
+        // The OS drops the shift flag for symbol keys, so recording
+        // Ctrl+Shift+2 stores "mod-@"; display folds it back to the chord the
+        // user actually pressed.
+        assert_eq!(display_combo_on(false, "mod-@"), "Ctrl+Shift+2");
+        assert_eq!(display_combo_on(true, "mod-@"), "Cmd+Shift+2");
+        assert_eq!(badge_combo_on(true, "mod-@"), "⇧⌘2");
+        // An explicit shift segment is left alone, as is a plain digit.
+        assert_eq!(display_combo_on(false, "mod-shift-@"), "Ctrl+Shift+@");
+        assert_eq!(display_combo_on(false, "mod-2"), "Ctrl+2");
     }
 
     #[test]
