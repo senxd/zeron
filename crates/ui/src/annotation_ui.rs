@@ -19,15 +19,16 @@ pub(crate) fn toolbar<T: 'static>(
     let button = div()
         .id("annotation-add-to-chat")
         .h(px(28.0))
-        .px(px(10.0))
+        .px(px(12.0))
         .flex()
         .items_center()
-        .rounded(px(8.0))
+        .rounded_full()
+        .overflow_hidden()
         .text_size(px(12.0))
         .font_weight(gpui::FontWeight::MEDIUM)
         .text_color(theme.text)
         .cursor_pointer()
-        .hover(|s| s.bg(crate::theme::ink(0.08)))
+        .hover(|s| s.bg(crate::theme::ink(0.08)).rounded_full())
         .child("Add to chat")
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(cx.listener(move |this, _, window, cx| {
@@ -40,7 +41,7 @@ pub(crate) fn toolbar<T: 'static>(
         div()
             .occlude()
             .mb(px(8.0))
-            .child(crate::popover::popover_card(theme).p(px(2.0)).child(button))
+            .child(composer_pill(theme, 28.0, button))
             .into_any_element(),
     )
 }
@@ -68,45 +69,64 @@ pub(crate) fn mini_composer<T: 'static>(
                     dismiss_escape(this, cx);
                 }
             }))
-            .child(
-                div()
-                    .w(px(280.0))
-                    .h(px(36.0))
-                    .flex()
-                    .items_center()
-                    .px(px(14.0))
-                    .rounded(px(18.0))
-                    .bg(theme.surface_overlay)
-                    .border_1()
-                    .border_color(theme.border)
-                    .shadow_lg()
-                    .overflow_hidden()
-                    .text_size(px(13.0))
-                    .text_color(theme.text)
-                    .child(input.into_any_element())
-                    .child(
-                        div()
-                            .id("annotation-delete")
-                            .role(gpui::Role::Button)
-                            .aria_label("Delete annotation")
-                            .mr(px(8.0))
-                            .size(px(18.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                delete_click(this, cx);
-                            }))
-                            .child(
-                                crate::icons::icon(crate::icons::CLOSE)
-                                    .size(px(11.0))
-                                    .text_color(theme.text_muted),
-                            ),
-                    ),
-            )
+            .child(composer_pill(
+                theme,
+                36.0,
+                {
+                    const CLOSE: f32 = 24.0;
+                    const INSET: f32 = 6.0;
+                    div()
+                        .w(px(280.0))
+                        .h(px(CLOSE + INSET * 2.0))
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .pl(px(14.0))
+                        .pr(px(INSET))
+                        .gap(px(8.0))
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h(px(CLOSE))
+                                .flex()
+                                .items_center()
+                                .overflow_hidden()
+                                .child(input.clone()),
+                        )
+                        .child(
+                            div()
+                                .id("annotation-delete")
+                                .role(gpui::Role::Button)
+                                .aria_label("Delete annotation")
+                                .flex_none()
+                                .size(px(CLOSE))
+                                .rounded_full()
+                                .bg(crate::theme::ink(0.08))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .hover(|s| {
+                                    s.bg(crate::theme::ink(0.14)).text_color(theme.text)
+                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    delete_click(this, cx);
+                                }))
+                                .child(
+                                    crate::icons::icon(crate::icons::CLOSE)
+                                        .size(px(12.0))
+                                        .text_color(theme.text_muted),
+                                ),
+                        )
+                },
+            ))
             .into_any_element(),
     )
 }
@@ -195,15 +215,36 @@ pub(crate) fn composer_chip<T: 'static>(
     )
 }
 
-fn floating(origin: Point<Pixels>, anchor: gpui::Anchor, child: AnyElement) -> AnyElement {
-    gpui::deferred(
-        gpui::anchored()
-            .position(origin)
-            .anchor(anchor)
-            .snap_to_window_with_margin(px(8.0))
+/// Same chrome as the chat composer pill: `input_glass_bg` over a 16px
+/// backdrop blur, hairline border, no drop shadow on glass.
+/// `height` is the content box; the corner radius is half of that so the
+/// blur and the outline stay a matching capsule.
+fn composer_pill(theme: &Theme, height: f32, child: impl IntoElement) -> crate::frost::Frosted {
+    let radius = height / 2.0;
+    crate::frost::frosted(
+        radius,
+        16.0,
+        div()
+            .rounded(px(radius))
+            .bg(theme.input_glass_bg())
+            .border_1()
+            .border_color(theme.border)
+            .when(!theme.is_frost(), |el| el.shadow_lg())
+            .overflow_hidden()
             .child(child),
     )
-    .into_any_element()
+}
+
+fn floating(origin: Point<Pixels>, anchor: gpui::Anchor, child: AnyElement) -> AnyElement {
+    // Stay in the root scene. `deferred` paints onto the transparent overlay
+    // plane, so `paint_backdrop_blur` would snapshot empty pixels instead of
+    // the transcript (the composer pill blurs because it is not deferred).
+    gpui::anchored()
+        .position(origin)
+        .anchor(anchor)
+        .snap_to_window_with_margin(px(8.0))
+        .child(child)
+        .into_any_element()
 }
 
 pub(crate) fn bounds_origin(bounds: Bounds<Pixels>) -> Point<Pixels> {

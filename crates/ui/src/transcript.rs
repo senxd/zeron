@@ -3071,7 +3071,7 @@ impl Transcript {
         let input = cx.new(|cx| {
             ComposerInput::new("Add an optional comment...", cx)
                 .with_single_line()
-                .with_text_metrics(13.0, 20.0)
+                .with_text_metrics(13.0, 24.0)
                 .with_accessibility_role(gpui::Role::TextInput)
         });
         if !existing.is_empty() {
