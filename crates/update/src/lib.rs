@@ -231,7 +231,14 @@ fn release_base(edge_url: &str) -> anyhow::Result<String> {
     if let Some(url) = windows::release_url()? {
         return Ok(url.trim_end_matches('/').to_owned());
     }
-    Ok(format!("{}/releases", edge_url.trim_end_matches('/')))
+    let edge = edge_url.trim_end_matches('/');
+    if edge == "https://edge.zeron.sh"
+        && let Some(url) = option_env!("ZERON_FORK_RELEASES_URL")
+        && !url.trim().is_empty()
+    {
+        return validate_release_override(url);
+    }
+    Ok(format!("{edge}/releases"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,6 +1010,24 @@ mod tests {
                 "linux",
             ),
             InstallKind::Unmanaged
+        );
+    }
+
+    #[test]
+    fn fork_feed_replaces_the_production_edge_only() {
+        if std::env::var("ZERON_RELEASES_URL")
+            .ok()
+            .is_some_and(|url| !url.trim().is_empty())
+        {
+            return;
+        }
+        assert_eq!(
+            release_base("https://edge.zeron.sh").unwrap(),
+            "https://github.com/senxd/zeron/releases/download/personal-latest"
+        );
+        assert_eq!(
+            release_base("http://127.0.0.1:9").unwrap(),
+            "http://127.0.0.1:9/releases"
         );
     }
 

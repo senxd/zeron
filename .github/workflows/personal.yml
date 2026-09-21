@@ -1,0 +1,256 @@
+name: personal
+
+on:
+  schedule:
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+    inputs:
+      feature:
+        description: Branch to merge into personal
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: personal
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sync.outputs.sha }}
+      changed: ${{ steps.sync.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: personal
+          fetch-depth: 0
+      - id: sync
+        env:
+          FEATURE: ${{ github.event.inputs.feature }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/zeronsh/zeron.git
+          git fetch upstream
+          before=$(git rev-parse HEAD)
+          git merge upstream/main -m "Merge upstream/main into personal"
+          if [ -n "$FEATURE" ]; then
+            case "$FEATURE" in
+              *[!A-Za-z0-9._/-]*|-*|/*|*//*) echo "invalid branch name: $FEATURE"; exit 1 ;;
+            esac
+            git fetch origin "$FEATURE"
+            git merge "origin/$FEATURE" -m "Merge $FEATURE into personal"
+          fi
+          after=$(git rev-parse HEAD)
+          if [ "$before" != "$after" ]; then
+            git push origin HEAD:personal
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$after" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+          - runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 0
+      - name: gpui system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: stamp personal version
+        run: |
+          set -euo pipefail
+          base=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          n=$(git rev-list --count HEAD)
+          ver="${base}.${n}"
+          awk -v ver="$ver" 'BEGIN{done=0} !done && /^version = / {sub(/"[^"]*"/, "\"" ver "\""); done=1} {print}' Cargo.toml > Cargo.toml.new
+          mv Cargo.toml.new Cargo.toml
+          echo "personal version $ver"
+      - name: package
+        run: scripts/package-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ runner.arch }}
+          path: target/package/*.tar.gz
+          if-no-files-found: error
+
+  macos:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 0
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: stamp personal version
+        run: |
+          set -euo pipefail
+          base=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          n=$(git rev-list --count HEAD)
+          ver="${base}.${n}"
+          awk -v ver="$ver" 'BEGIN{done=0} !done && /^version = / {sub(/"[^"]*"/, "\"" ver "\""); done=1} {print}' Cargo.toml > Cargo.toml.new
+          mv Cargo.toml.new Cargo.toml
+          echo "personal version $ver"
+      - name: import Developer ID certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          keychain="$RUNNER_TEMP/release.keychain-db"
+          pass="$(openssl rand -hex 16)"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          printf '%s' "$MACOS_CERT_P12" | base64 -d >"$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+          [ -n "$identity" ] || { echo "p12 contains no Developer ID Application identity"; exit 1; }
+          echo "CODESIGN_IDENTITY=$identity" >>"$GITHUB_ENV"
+      - name: notary credentials
+        if: env.AC_API_KEY_P8 != ''
+        run: |
+          printf '%s' "$AC_API_KEY_P8" >"$RUNNER_TEMP/ac_api_key.p8"
+          {
+            echo "NOTARY_KEY_PATH=$RUNNER_TEMP/ac_api_key.p8"
+            echo "NOTARY_KEY_ID=$AC_API_KEY_ID"
+            echo "NOTARY_ISSUER_ID=$AC_API_ISSUER_ID"
+          } >>"$GITHUB_ENV"
+      - name: package dmg
+        run: scripts/package-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ runner.arch }}
+          path: |
+            target/package/*.dmg
+            target/package/*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 0
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Locate Windows SDK shader compiler
+        run: |
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin/*/x64/fxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe is required for GPUI release shaders' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" >> $env:GITHUB_ENV
+      - uses: Swatinem/rust-cache@v2
+      - name: stamp personal version
+        run: |
+          $base = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $n = (git rev-list --count HEAD).Trim()
+          $ver = "$base.$n"
+          $raw = Get-Content Cargo.toml -Raw
+          $updated = [regex]::new('(?m)^version = "[^"]*"').Replace($raw, "version = `"$ver`"", 1)
+          Set-Content -Path Cargo.toml -Value $updated -NoNewline
+          Write-Host "personal version $ver"
+      - name: package portable app
+        run: ./scripts/package-windows.ps1 -ReleasesUrl "https://github.com/${env:GITHUB_REPOSITORY}/releases/download/personal-latest"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ runner.arch }}
+          path: |
+            target/package/*.zip
+            target/package/*.exe
+          if-no-files-found: error
+
+  publish:
+    needs: [sync, linux, macos, windows]
+    if: needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: manifest
+        run: |
+          set -euo pipefail
+          base=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          n=$(git rev-list --count HEAD)
+          ver="${base}.${n}"
+          ls dist/
+          for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
+              macos-arm64.dmg macos-arm64-app.tar.gz \
+              windows-x86_64.zip windows-x86_64.exe; do
+            test -f "dist/zeron-$ver-$platform" \
+              || { echo "missing artifact: zeron-$ver-$platform"; exit 1; }
+          done
+          manifest=$(jq -n --arg version "$ver" '{version: $version, files: {}}')
+          for f in dist/*; do
+            sha=$(sha256sum "$f" | cut -d' ' -f1)
+            manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
+              '.files[$name] = {sha256: $sha}' <<<"$manifest")
+          done
+          printf '%s' "$manifest" > manifest.json
+          printf '%s' "$ver" > latest.txt
+          echo "VERSION=$ver" >> "$GITHUB_ENV"
+      - name: publish personal-latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git tag -f personal-latest
+          git push -f origin personal-latest
+          notes="Build of personal at ${GITHUB_SHA} (${VERSION})."
+          if gh release view personal-latest >/dev/null 2>&1; then
+            gh release upload personal-latest manifest.json latest.txt dist/* --clobber
+            gh release edit personal-latest --title "personal" --notes "$notes"
+          else
+            gh release create personal-latest manifest.json latest.txt dist/* \
+              --title "personal" --notes "$notes"
+          fi

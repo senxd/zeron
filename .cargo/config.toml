@@ -1,0 +1,2 @@
+[env]
+ZERON_FORK_RELEASES_URL = "https://github.com/senxd/zeron/releases/download/personal-latest"
