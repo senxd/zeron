@@ -3088,6 +3088,7 @@ mod tests {
                 device_id: "host".into(),
                 status: None,
                 continuation_of: None,
+                duration_ms: None,
             })
             .unwrap();
         // Hold publication blocked: the opening must not await the full mirror.
@@ -3315,6 +3316,7 @@ mod context_usage_tests {
                     device_id: "writer".into(),
                     status: Some(zeron_doc::MessageStatus::Streaming),
                     continuation_of: None,
+                    duration_ms: None,
                 })
                 .unwrap()
         };
@@ -3435,6 +3437,7 @@ mod context_usage_tests {
             device_id: "host".into(),
             status: Some(zeron_doc::MessageStatus::Streaming),
             continuation_of: None,
+            duration_ms: None,
         };
         handle.doc().push_message(&entry("local-before")).unwrap();
         source.update_context_usage(Some(10), Some(100)).unwrap();
