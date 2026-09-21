@@ -217,7 +217,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: artifacts
           merge-multiple: true
       - name: manifest
         run: |
@@ -225,15 +225,15 @@ jobs:
           base=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           n=$(git rev-list --count HEAD)
           ver="${base%.*}.$(( ${base##*.} * 100000 + n ))"
-          ls dist/
+          ls artifacts/
           for platform in linux-x86_64.tar.gz linux-aarch64.tar.gz \
               macos-arm64.dmg macos-arm64-app.tar.gz \
               windows-x86_64.zip windows-x86_64.exe; do
-            test -f "dist/zeron-$ver-$platform" \
+            test -f "artifacts/zeron-$ver-$platform" \
               || { echo "missing artifact: zeron-$ver-$platform"; exit 1; }
           done
           manifest=$(jq -n --arg version "$ver" '{version: $version, files: {}}')
-          for f in dist/*; do
+          for f in artifacts/*; do
             sha=$(sha256sum "$f" | cut -d' ' -f1)
             manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
               '.files[$name] = {sha256: $sha}' <<<"$manifest")
@@ -250,9 +250,9 @@ jobs:
           git push -f origin personal-latest
           notes="Build of personal at ${GITHUB_SHA} (${VERSION})."
           if gh release view personal-latest >/dev/null 2>&1; then
-            gh release upload personal-latest manifest.json latest.txt dist/* --clobber
+            gh release upload personal-latest manifest.json latest.txt artifacts/* --clobber
             gh release edit personal-latest --title "personal" --notes "$notes"
           else
-            gh release create personal-latest manifest.json latest.txt dist/* \
+            gh release create personal-latest manifest.json latest.txt artifacts/* \
               --title "personal" --notes "$notes"
           fi
