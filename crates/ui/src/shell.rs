@@ -1810,6 +1810,9 @@ impl Shell {
                 ComposerEvent::OpenLoadoutSettings => {
                     this.open_settings(SettingsSection::Loadout, cx)
                 }
+                ComposerEvent::AnnotationsCleared { .. } => {
+                    transcript.update(cx, |t, cx| t.dismiss_annotation_draft(cx));
+                }
                 ComposerEvent::NewThreadTransitionStarted => {
                     // Route observation drives the dock once selection commits.
                     cx.notify();
