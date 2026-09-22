@@ -241,7 +241,8 @@ fn effort_word(word: &str) -> Option<ReasoningLevel> {
 /// Traits a variant label carries past the family label: trailing `1M`
 /// context, trailing `Fast` (Devin's priority serving tier), a bare
 /// `Thinking` toggle, or an effort word optionally qualified by `Thinking`
-/// ("Low Thinking" → Low, "No Thinking" → Minimal).
+/// ("Low Thinking" → Low, "No Thinking" → Minimal). `1M`/`Fast` stack in
+/// either order, so peel both until neither strips.
 fn variant_traits(family_label: &str, label: &str) -> (Option<ReasoningLevel>, bool, bool, bool) {
     let normalized = norm(label);
     let mut rest = normalized
@@ -249,13 +250,16 @@ fn variant_traits(family_label: &str, label: &str) -> (Option<ReasoningLevel>, b
         .unwrap_or(normalized.as_str());
     let mut context_1m = false;
     let mut fast = false;
-    if let Some(r) = rest.strip_suffix("1m") {
-        rest = r;
-        context_1m = true;
-    }
-    if let Some(r) = rest.strip_suffix("fast") {
-        rest = r;
-        fast = true;
+    loop {
+        if let Some(r) = rest.strip_suffix("1m") {
+            rest = r;
+            context_1m = true;
+        } else if let Some(r) = rest.strip_suffix("fast") {
+            rest = r;
+            fast = true;
+        } else {
+            break;
+        }
     }
     if rest == "thinking" {
         return (None, true, fast, context_1m);
@@ -403,6 +407,9 @@ fn pick_variant(
         })
         .collect();
 
+    // A stale reasoning pick must not sink a run on a model with no effort
+    // axis at all (the UI clamps to the ladder only when one exists).
+    let reasoning = reasoning.filter(|_| variants.iter().any(|v| v.effort.is_some()));
     let resolved = match reasoning {
         Some(level) => candidates.iter().find(|v| v.effort == Some(level)).copied(),
         None => [ReasoningLevel::Medium, ReasoningLevel::High]
@@ -479,7 +486,7 @@ fn parse_catalog(bytes: &[u8]) -> Result<ParsedCatalog, HarnessError> {
             }
         }
 
-        let is_fusion = norm(&id) == "fusion";
+        let is_fusion = norm(&id) == "fusion" || id.starts_with("fusion-");
         let rows: Vec<(ParsedVariant, &Variant)> = if is_fusion {
             family
                 .variants
@@ -885,6 +892,56 @@ mod tests {
         // A combination Devin doesn't offer fails loudly.
         opts.insert("lead".into(), Value::String("gpt-5-6-sol".into()));
         assert!(resolve(&parsed, "fusion", Some(ReasoningLevel::High), &opts).is_err());
+    }
+
+    #[test]
+    fn trait_suffixes_parse_in_either_order() {
+        let parsed = parse(
+            br#"{"families":[{
+            "family_uid":"claude-opus-5", "family_label":"Claude Opus 5", "variants":[
+                {"model_uid":"claude-opus-5","label":"Claude Opus 5"},
+                {"model_uid":"claude-opus-5-fast-1m","label":"Claude Opus 5 Fast 1M"},
+                {"model_uid":"claude-opus-5-1m-fast","label":"Claude Opus 5 1M Fast"}
+            ]
+        }]}"#,
+        );
+        let ids: Vec<&str> = parsed.models[0]
+            .options
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect();
+        assert_eq!(ids, ["contextWindow", "fastMode"]);
+        let mut opts = no_opts();
+        opts.insert("contextWindow".into(), Value::String("1m".into()));
+        opts.insert("fastMode".into(), Value::String("on".into()));
+        // Both spellings carry both flags; the first matching variant wins.
+        assert!(matches!(
+            resolve(&parsed, "claude-opus-5", None, &opts).unwrap(),
+            Resolution::Variant(uid) if uid == "claude-opus-5-fast-1m" || uid == "claude-opus-5-1m-fast"
+        ));
+    }
+
+    #[test]
+    fn stale_reasoning_ignored_when_the_model_has_no_effort_axis() {
+        let parsed = parse(
+            br#"{"families":[{
+            "family_uid":"claude-opus-4.6", "family_label":"Claude Opus 4.6", "variants":[
+                {"model_uid":"claude-opus-4-6","label":"Claude Opus 4.6"},
+                {"model_uid":"claude-opus-4-6-thinking","label":"Claude Opus 4.6 Thinking"}
+            ]
+        }]}"#,
+        );
+        match resolve(
+            &parsed,
+            "claude-opus-4.6",
+            Some(ReasoningLevel::High),
+            &no_opts(),
+        )
+        .unwrap()
+        {
+            Resolution::Variant(uid) => assert_eq!(uid, "claude-opus-4-6"),
+            _ => panic!("resolved"),
+        }
     }
 
     #[test]
