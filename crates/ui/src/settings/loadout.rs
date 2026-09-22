@@ -544,7 +544,12 @@ impl LoadoutPage {
                 value: slot.label.clone(),
                 enabled: true,
             },
-            MenuEntry {
+        ];
+        // No ladder → no row: models whose effort rides a named parameter
+        // (Cursor's `reasoning_effort`/`reasoning` options) already show it as
+        // an option row — a disabled "Default" twin reads as a duplicate.
+        if model.is_some_and(|m| !m.reasoning_levels.is_empty()) {
+            entries.push(MenuEntry {
                 menu: SlotMenu::Effort(index),
                 label: "Effort".into(),
                 value: slot
@@ -552,9 +557,9 @@ impl LoadoutPage {
                     .map(reasoning_label)
                     .unwrap_or("Default")
                     .into(),
-                enabled: model.is_some_and(|m| !m.reasoning_levels.is_empty()),
-            },
-        ];
+                enabled: true,
+            });
+        }
         for (option_index, option) in self.available_slot_options(index).into_iter().enumerate() {
             let selected = slot
                 .model_options
@@ -1246,6 +1251,59 @@ mod tests {
         });
         cx.refresh().unwrap();
         assert!(cx.debug_bounds("loadout-fast-0").is_none());
+    }
+
+    #[gpui::test]
+    fn effort_row_is_skipped_when_effort_is_a_model_option(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            cx.set_reduce_motion(true);
+        });
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let mut page = fixture_page(cx);
+            let option_backed = Model {
+                id: "grok-4.7".into(),
+                label: "Grok 4.7".into(),
+                description: None,
+                reasoning_levels: vec![],
+                options: vec![zeron_proto::ModelOption {
+                    id: "reasoning_effort".into(),
+                    label: "Effort".into(),
+                    default_choice: "low".into(),
+                    choices: vec![
+                        zeron_proto::ModelOptionChoice {
+                            id: "low".into(),
+                            label: "Low".into(),
+                        },
+                        zeron_proto::ModelOptionChoice {
+                            id: "high".into(),
+                            label: "High".into(),
+                        },
+                    ],
+                }],
+            };
+            page.models
+                .insert(HarnessId::Codex, Loadable::Ready(vec![option_backed]));
+            page.loadout.place(
+                0,
+                LoadoutSlot {
+                    harness: HarnessId::Codex,
+                    model: "grok-4.7".into(),
+                    label: "Grok 4.7".into(),
+                    reasoning: None,
+                    model_options: Default::default(),
+                    shortcut: None,
+                },
+            );
+            page
+        });
+        page.read_with(cx, |page, _| {
+            let entries = page.root_menu_entries(0);
+            let effort_rows: Vec<_> = entries.iter().filter(|e| e.label == "Effort").collect();
+            assert_eq!(effort_rows.len(), 1);
+            assert!(matches!(effort_rows[0].menu, SlotMenu::Option(0, 0)));
+            assert!(effort_rows[0].enabled);
+        });
     }
 
     #[gpui::test]

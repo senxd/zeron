@@ -133,6 +133,10 @@ struct AcpAgentSpec {
     /// `…-high`) instead of a `thought_level` option: discovered variants fold
     /// into one row with a ladder, and a run sends the variant for its level.
     effort_in_model_id: bool,
+    /// the agent advertises fast mode as a separate model id
+    /// (`…-build-fast`): the variant folds into the base row's Fast option,
+    /// and a run recomposes the advertised id when the option is on (Grok).
+    fast_in_model_id: bool,
     /// auth method to sign in with when `session/new` answers auth_required —
     /// for agents that expect the client to pick one before the first session.
     auth_method: Option<&'static str>,
@@ -263,6 +267,9 @@ fn grok_spec() -> AcpAgentSpec {
              process or a hung startup check; zeron launches it with --no-leader \
              and --no-auto-update to avoid both.",
         effort_in_model_id: false,
+        // `grok-4.7-build-fast` advertises as its own model; the picker folds
+        // it into the base row's Fast toggle.
+        fast_in_model_id: true,
         auth_method: None,
         skill_dirs: Vec::new,
         hidden_commands: &[],
@@ -339,6 +346,7 @@ fn devin_spec() -> AcpAgentSpec {
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
         effort_in_model_id: false,
+        fast_in_model_id: false,
         auth_method: None,
         skill_dirs: Vec::new,
         hidden_commands: &[],
@@ -409,6 +417,7 @@ fn hermes_spec() -> AcpAgentSpec {
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
         effort_in_model_id: false,
+        fast_in_model_id: false,
         auth_method: None,
         skill_dirs: Vec::new,
         hidden_commands: &[],
@@ -470,6 +479,7 @@ fn pi_spec() -> AcpAgentSpec {
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
         effort_in_model_id: false,
+        fast_in_model_id: false,
         auth_method: None,
         skill_dirs: Vec::new,
         hidden_commands: &[],
@@ -764,6 +774,7 @@ fn antigravity_spec() -> AcpAgentSpec {
         prompt_stall: None,
         stall_hint: "The agent process is likely wedged.",
         effort_in_model_id: true,
+        fast_in_model_id: false,
         // the personal oauth method is only the first-run default; sign-in
         // preserves any method already selected in antigravity's settings.
         auth_method: Some("oauth-personal"),
@@ -1432,6 +1443,9 @@ impl AcpHarness {
             }
             if self.spec.effort_in_model_id {
                 models = group_effort_variants(models);
+            }
+            if self.spec.fast_in_model_id {
+                models = fold_fast_variants(models);
             }
             Ok::<Vec<Model>, HarnessError>(models)
         };
@@ -2184,6 +2198,7 @@ impl Harness for AcpHarness {
             prompt_stall: self.spec.prompt_stall,
             stall_hint: self.spec.stall_hint,
             effort_in_model_id: self.spec.effort_in_model_id,
+            fast_in_model_id: self.spec.fast_in_model_id,
             auth_method: self.spec.auth_method,
             sessions_root: self.sessions_root.clone(),
             interrupt_grace: self.interrupt_grace,
@@ -2222,6 +2237,7 @@ struct Session {
     prompt_stall: Option<Duration>,
     stall_hint: &'static str,
     effort_in_model_id: bool,
+    fast_in_model_id: bool,
     auth_method: Option<&'static str>,
     /// Sessions-root override for the subagent transcript tail (tests).
     sessions_root: Option<PathBuf>,
@@ -2961,6 +2977,121 @@ fn group_effort_variants(models: Vec<Model>) -> Vec<Model> {
         .collect()
 }
 
+/// Suffixes Grok uses for its fast variant ids (`grok-4.7-build-fast`).
+const FAST_SUFFIXES: [&str; 2] = ["-build-fast", "-fast"];
+
+fn strip_fast_suffix(id: &str) -> Option<&str> {
+    FAST_SUFFIXES.iter().find_map(|s| id.strip_suffix(s))
+}
+
+/// A two-choice Fast option matching the picker's speed-toggle shape
+/// (`on` is what `speed_choice_id` and `option_on` recognize as enabled).
+fn fast_toggle_option() -> ModelOption {
+    ModelOption {
+        id: "fast".into(),
+        label: "Fast".into(),
+        choices: vec![
+            ModelOptionChoice {
+                id: "off".into(),
+                label: "Off".into(),
+            },
+            ModelOptionChoice {
+                id: "on".into(),
+                label: "On".into(),
+            },
+        ],
+        default_choice: "off".into(),
+    }
+}
+
+fn model_option_on(options: &serde_json::Map<String, Value>, id: &str) -> bool {
+    options
+        .get(id)
+        .and_then(Value::as_str)
+        .is_some_and(|v| matches!(v, "on" | "true" | "fast" | "priority"))
+}
+
+/// Fold `<base>-build-fast` (or `-fast`) rows into the base model's Fast
+/// option; orphan variants without an advertised base stay as their own row.
+fn fold_fast_variants(models: Vec<Model>) -> Vec<Model> {
+    let ids: HashSet<String> = models.iter().map(|m| m.id.clone()).collect();
+    let has_fast_sibling = |id: &str| {
+        FAST_SUFFIXES
+            .iter()
+            .any(|s| ids.contains(&format!("{id}{s}")))
+    };
+    models
+        .into_iter()
+        .filter_map(|mut model| {
+            if strip_fast_suffix(&model.id).is_some_and(|base| ids.contains(base)) {
+                return None;
+            }
+            if has_fast_sibling(&model.id)
+                && !model.options.iter().any(|o| {
+                    o.id.eq_ignore_ascii_case("fast") || o.id.eq_ignore_ascii_case("fastmode")
+                })
+            {
+                model.options.push(fast_toggle_option());
+            }
+            Some(model)
+        })
+        .collect()
+}
+
+/// Model ids the session advertises, across both selection surfaces:
+/// the `model` config option's values and the legacy `availableModels` state.
+fn advertised_model_ids(session_response: &Value) -> Vec<&str> {
+    let config = session_response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options
+                .iter()
+                .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+        })
+        .and_then(|o| o.get("options").and_then(Value::as_array))
+        .map(|choices| {
+            choices
+                .iter()
+                .filter_map(|c| c.get("value").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let legacy = session_response
+        .get("models")
+        .and_then(|m| m.get("availableModels"))
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m.get("modelId").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    config.into_iter().chain(legacy).collect()
+}
+
+/// The advertised fast variant for a folded model when the Fast option is on.
+/// A saved `<base>-build-fast` id passes through untouched, and nothing is
+/// invented: when no variant is advertised the requested id goes out as-is.
+fn fast_variant_id(
+    session_response: &Value,
+    model: &str,
+    model_options: &serde_json::Map<String, Value>,
+) -> String {
+    if strip_fast_suffix(model).is_none() && model_option_on(model_options, "fast") {
+        let advertised = advertised_model_ids(session_response);
+        if let Some(variant) = FAST_SUFFIXES
+            .iter()
+            .map(|s| format!("{model}{s}"))
+            .find(|v| advertised.iter().any(|id| id == v))
+        {
+            return variant;
+        }
+    }
+    model.to_owned()
+}
+
 /// the advertised variant id for a grouped model: the picked level when the
 /// model offers it, else its strongest level. Ids the agent already
 /// advertises (chats saved with a full variant id) pass through untouched.
@@ -3170,6 +3301,7 @@ async fn run_session(session: Session) {
         prompt_stall,
         stall_hint,
         effort_in_model_id,
+        fast_in_model_id,
         auth_method,
         sessions_root,
         prompt_transform,
@@ -3276,6 +3408,11 @@ async fn run_session(session: Session) {
                 &session_response,
                 model,
                 request.reasoning,
+            )),
+            Some(model) if fast_in_model_id => Some(fast_variant_id(
+                &session_response,
+                model,
+                &request.model_options,
             )),
             model => model.map(str::to_owned),
         };
@@ -5344,6 +5481,71 @@ mod tests {
             "gemini-legacy"
         );
         assert_eq!(id("unknown-model", None), "unknown-model");
+    }
+
+    fn grok_catalog() -> Value {
+        json!({
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "options": [
+                    {"value": "grok-4.7", "name": "Grok 4.7"},
+                    {"value": "grok-4.7-build-fast", "name": "Grok 4.7 Build Fast"},
+                    {"value": "grok-4.6", "name": "Grok 4.6"},
+                    {"value": "orphan-fast", "name": "Orphan Fast"},
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn fast_variants_fold_into_the_base_models_fast_option() {
+        let models = fold_fast_variants(models_from_session(&grok_catalog(), &[]));
+        let rows: Vec<(String, Vec<String>)> = models
+            .iter()
+            .map(|m| {
+                (
+                    m.id.clone(),
+                    m.options.iter().map(|o| o.id.clone()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("grok-4.7".into(), vec!["fast".into()]),
+                ("grok-4.6".into(), vec![]),
+                // no advertised base → stays its own row rather than vanish
+                ("orphan-fast".into(), vec![]),
+            ]
+        );
+        let toggle = models[0].options.iter().find(|o| o.id == "fast").unwrap();
+        assert_eq!(toggle.default_choice, "off");
+        assert_eq!(toggle.choices[1].id, "on");
+    }
+
+    #[test]
+    fn fast_variant_id_recomposes_only_when_the_option_is_on() {
+        let catalog = grok_catalog();
+        let mut on = serde_json::Map::new();
+        on.insert("fast".into(), Value::String("on".into()));
+        let mut off = serde_json::Map::new();
+        off.insert("fast".into(), Value::String("off".into()));
+        let unset = serde_json::Map::new();
+        assert_eq!(
+            fast_variant_id(&catalog, "grok-4.7", &on),
+            "grok-4.7-build-fast"
+        );
+        assert_eq!(fast_variant_id(&catalog, "grok-4.7", &off), "grok-4.7");
+        assert_eq!(fast_variant_id(&catalog, "grok-4.7", &unset), "grok-4.7");
+        // saved full ids pass through; no variant is invented for others
+        assert_eq!(
+            fast_variant_id(&catalog, "grok-4.7-build-fast", &unset),
+            "grok-4.7-build-fast"
+        );
+        assert_eq!(fast_variant_id(&catalog, "grok-4.6", &on), "grok-4.6");
+        assert_eq!(fast_variant_id(&catalog, "unknown", &on), "unknown");
     }
 
     #[test]
