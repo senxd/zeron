@@ -4018,6 +4018,9 @@ pub struct Composer {
     pub(crate) input: Entity<ComposerInput>,
     /// Draft displaced while a queued message occupies the composer.
     pub(crate) queue_edit_draft: Option<(String, Vec<StagedAttachment>, Vec<CapturedAppshot>)>,
+    /// Annotations that were already staged when a queue edit took the composer.
+    /// Restored on save or cancel so the queued row's chip does not stick.
+    pub(crate) queue_edit_annotations: Option<Vec<crate::annotations::TranscriptAnnotation>>,
     /// Composer actions row plus the new-session floating target tab
     /// ([`Pickers::render_new_thread_target_selectors`]).
     pickers: Entity<Pickers>,
@@ -4285,6 +4288,7 @@ impl Composer {
             state,
             input,
             queue_edit_draft: None,
+            queue_edit_annotations: None,
             pickers,
             drafts: HashMap::new(),
             attachments: HashMap::new(),

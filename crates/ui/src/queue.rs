@@ -172,6 +172,38 @@ impl Render for QueueGhost {
 
 /// One line of a queued message: the newlines that make it a paragraph in the
 /// composer make it three rows here, and the row is one line tall.
+/// Queue label: hide folded annotation/comment blocks, and when the request
+/// itself is empty show the badge ("1 annotation") instead of a blank row.
+fn queue_row_text(text: &str, attachments: &[String]) -> String {
+    let visible = queue_visible_text(text, attachments);
+    let (text, badges) = crate::badges::split(&visible);
+    if text.trim().is_empty() {
+        if let Some(badge) = badges.into_iter().next() {
+            return badge.label.to_string();
+        }
+    }
+    text
+}
+
+/// Text for the composer input, plus annotations to restage as a chip.
+/// The folded preamble must not land in the editor.
+fn queue_edit_prompt(
+    raw: &str,
+    attachments: &[String],
+) -> (String, Vec<crate::annotations::TranscriptAnnotation>) {
+    let annotations = crate::annotations::annotations_from_text(raw).unwrap_or_default();
+    let stripped = crate::annotations::extract_badge(raw)
+        .map(|(text, _)| text)
+        .unwrap_or_else(|| raw.to_string());
+    let text = queue_visible_text(&stripped, attachments);
+    let text = if !attachments.is_empty() && text == crate::attachments::ATTACHMENT_ONLY_TEXT {
+        String::new()
+    } else {
+        text
+    };
+    (text, annotations)
+}
+
 fn one_line(text: &str) -> SharedString {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     SharedString::from(flat)
@@ -405,13 +437,7 @@ impl Composer {
             Some(QueueDeliveryGate::ReviewRequired { .. }) if !being_edited => {
                 SharedString::from("Needs review")
             }
-            _ => {
-                let raw = queue_visible_text(&item.text, &item.attachments);
-                let visible = crate::annotations::extract_badge(&raw)
-                    .map(|(text, _)| text)
-                    .unwrap_or(raw);
-                one_line(&visible)
-            }
+            _ => one_line(&queue_row_text(&item.text, &item.attachments))
         };
 
         let edit_id = item.id.clone();
@@ -1373,10 +1399,7 @@ impl Composer {
                             .unwrap_or_default()
                             .to_string();
                         let attachments: Vec<String> = serde_json::from_value(reply["attachments"].clone()).unwrap_or_default();
-                        let text = queue_visible_text(&raw_text, &attachments);
-                        let text = if !attachments.is_empty() && text == crate::attachments::ATTACHMENT_ONLY_TEXT {
-                            String::new()
-                        } else { text };
+                        let (text, annotations) = queue_edit_prompt(&raw_text, &attachments);
                         let selected_matches = composer.state.read(cx).selected_chat.as_deref()
                             == Some(chat_id.as_str());
                         if !selected_matches || !composer.can_edit_queue_in_composer() {
@@ -1413,6 +1436,7 @@ impl Composer {
                         composer.appshots.insert(composer.current_key.clone(), loaded_appshots);
                         composer.focus_pending = true;
                         composer.input.update(cx, |input, cx| input.set_text(text, cx));
+                        composer.install_queue_edit_annotations(annotations, cx);
                         composer.start_queue_edit_renewal(engine.clone(), cx);
                     }
                     Ok(reply)
@@ -1445,9 +1469,19 @@ impl Composer {
             return false;
         }
         let text = self.input.read(cx).text().trim().to_string();
-        if text.is_empty() && self.staged().is_empty() && self.staged_appshots().is_empty() {
+        let annotations = self
+            .state
+            .read(cx)
+            .transcript_annotations(&self.current_key)
+            .to_vec();
+        if text.is_empty()
+            && self.staged().is_empty()
+            && self.staged_appshots().is_empty()
+            && annotations.is_empty()
+        {
             self.finish_queue_edit("discard", None, cx);
         } else {
+            let text = crate::annotations::with_annotations(&text, &annotations);
             self.finish_queue_edit("commit", Some(text), cx);
         }
         true
@@ -1465,6 +1499,48 @@ impl Composer {
     pub(crate) fn clear_queue_edit(&mut self, cx: &mut Context<Self>) {
         self.release_queue_edit_best_effort(cx);
         self.clear_queue_edit_local(cx);
+    }
+
+    /// Swap the composer's staged annotations for the queued row's, remembering
+    /// what was there so save and cancel can put it back.
+    fn install_queue_edit_annotations(
+        &mut self,
+        annotations: Vec<crate::annotations::TranscriptAnnotation>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = self.current_key.clone();
+        let previous = self.state.update(cx, |state, _| {
+            let previous = state.take_transcript_annotations(&key);
+            for annotation in annotations {
+                state.add_transcript_annotation(&key, annotation);
+            }
+            previous
+        });
+        self.queue_edit_annotations = Some(previous);
+        self.sync_annotation_washes(cx);
+    }
+
+    fn restore_queue_edit_annotations(&mut self, cx: &mut Context<Self>) {
+        let Some(previous) = self.queue_edit_annotations.take() else {
+            return;
+        };
+        let key = self.current_key.clone();
+        self.state.update(cx, |state, _| {
+            state.purge_transcript_annotations(&key);
+            for annotation in previous {
+                state.add_transcript_annotation(&key, annotation);
+            }
+        });
+        self.sync_annotation_washes(cx);
+    }
+
+    fn sync_annotation_washes(&self, cx: &mut Context<Self>) {
+        let current = self
+            .state
+            .read(cx)
+            .transcript_annotations(&self.current_key)
+            .to_vec();
+        crate::annotations::sync_staged_washes(&current);
     }
 
     fn clear_queue_edit_local(&mut self, cx: &mut Context<Self>) {
@@ -1487,6 +1563,7 @@ impl Composer {
             self.attachments
                 .insert(self.current_key.clone(), attachments);
         }
+        self.restore_queue_edit_annotations(cx);
         self.focus_pending = true;
         cx.notify();
     }
@@ -2083,5 +2160,40 @@ mod appshot_edit_tests {
             assert_eq!(composer.staged_appshots()[1].id, "during-save");
             assert!(composer.editing_queued.is_none());
         });
+    }
+}
+
+#[cfg(test)]
+mod annotation_queue_tests {
+    use super::{queue_edit_prompt, queue_row_text};
+    use crate::annotations::{TranscriptAnnotation, with_annotations};
+    use crate::markdown::selection::Span;
+
+    fn quote() -> TranscriptAnnotation {
+        TranscriptAnnotation::from_selection(
+            "msg",
+            vec![Span {
+                key: "k".into(),
+                range: 0..5,
+                text: "hello".into(),
+            }],
+            "hello".to_string(),
+        )
+    }
+
+    #[test]
+    fn annotation_only_row_uses_the_chip_label() {
+        let raw = with_annotations("", &[quote()]);
+        assert_eq!(queue_row_text(&raw, &[]), "1 annotation");
+    }
+
+    #[test]
+    fn annotation_edit_strips_the_preamble_and_restores_the_quote() {
+        let raw = with_annotations("ship it", &[quote()]);
+        let (text, annotations) = queue_edit_prompt(&raw, &[]);
+        assert_eq!(text, "ship it");
+        assert_eq!(annotations.len(), 1);
+        assert_eq!(annotations[0].text, "hello");
+        assert!(!text.contains("# Response annotations:"));
     }
 }
