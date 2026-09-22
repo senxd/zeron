@@ -273,16 +273,10 @@ const RING_STROKE: f32 = 2.5;
 /// Polyline segments for a full circle — plenty for a ≤40px ring.
 const RING_SEGMENTS: f32 = 64.0;
 
-/// Radial upload-progress ring with the percent centered — overlaid on a
-/// sending echo's attachment thumbnail while its bytes cross the relay
-/// (2026-08-18 "Sending… forever" report; the thumbnail is where the wait
-/// visibly belongs). A faint full track plus a bright arc growing clockwise
-/// from 12 o'clock; gpui paths have no arc primitive, so both are stroked
-/// polylines. Fixed white-on-wash palette: the caller dims the image behind
-/// it, which reads in both themes.
-pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
-    let frac = f32::from(percent.min(100)) / 100.0;
-    let ring = canvas(
+/// The stroked track + clockwise arc shared by both rings — gpui paths have
+/// no arc primitive, so both are polylines.
+fn ring_canvas(diameter: f32, frac: f32, track: gpui::Hsla, fill: gpui::Hsla) -> gpui::Canvas<()> {
+    canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
             let center = bounds.center();
@@ -310,9 +304,25 @@ pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
                     window.paint_path(path, color);
                 }
             };
-            paint_arc(1.0, gpui::hsla(0.0, 0.0, 1.0, 0.22));
-            paint_arc(frac, gpui::hsla(0.0, 0.0, 1.0, 0.95));
+            paint_arc(1.0, track);
+            paint_arc(frac.clamp(0.0, 1.0), fill);
         },
+    )
+}
+
+/// Radial upload-progress ring with the percent centered — overlaid on a
+/// sending echo's attachment thumbnail while its bytes cross the relay
+/// (2026-08-18 "Sending… forever" report; the thumbnail is where the wait
+/// visibly belongs). A faint full track plus a bright arc growing clockwise
+/// from 12 o'clock. Fixed white-on-wash palette: the caller dims the image
+/// behind it, which reads in both themes.
+pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
+    let frac = f32::from(percent.min(100)) / 100.0;
+    let ring = ring_canvas(
+        diameter,
+        frac,
+        gpui::hsla(0.0, 0.0, 1.0, 0.22),
+        gpui::hsla(0.0, 0.0, 1.0, 0.95),
     )
     .absolute()
     .inset_0();
@@ -330,6 +340,15 @@ pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
                 .text_color(gpui::hsla(0.0, 0.0, 1.0, 0.95))
                 .child(SharedString::from(format!("{percent}%"))),
         )
+        .into_any_element()
+}
+
+/// Provider-usage ring for the composer chip: the track + arc recipe of
+/// [`upload_progress_ring`], themed colors, no centered percent — the chip
+/// is too small for digits.
+pub fn usage_ring(fraction: f32, diameter: f32, fill: gpui::Hsla, track: gpui::Hsla) -> AnyElement {
+    ring_canvas(diameter, fraction, track, fill)
+        .size(px(diameter))
         .into_any_element()
 }
 

@@ -2,7 +2,8 @@
 //! in-app folder browser + clone/create), BranchPicker (search + isolated-
 //! worktree toggle), HarnessModelPicker (harness rail + model list, harness
 //! locked once the chat exists), TraitsPicker (reasoning ladder + advertised
-//! model options; trigger shows the non-default summary "High · 1M · Fast").
+//! model options; trigger shows the non-default summary "High · Auto" — the
+//! speed pick is a bolt icon and context size stays off the chip).
 //!
 //! All selections accumulate into a [`DraftConfig`] the composer threads into
 //! the Run command and the `Mutate createChat` call on first send.
@@ -221,9 +222,12 @@ pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
 
 /// The TraitsPicker trigger summary: the effective reasoning level plus every
 /// model option's effective choice — the explicit pick when one is saved and
-/// still offered, else the option's default — joined with " · " ("High · 1M ·
-/// Fast", Cursor's "Agent · Balance"). The Standard service tier is omitted;
-/// other effective choices stay visible. `None` means there is no visible suffix.
+/// still offered, else the option's default — joined with " · " ("High ·
+/// Auto", Cursor's "Agent · Balance"). Context-window options never show (the
+/// size reads on the picker's own row), and the speed option is omitted —
+/// the bolt icon beside the chip owns it. The Standard service tier is
+/// omitted; other effective choices stay visible. `None` means there is no
+/// visible suffix.
 pub fn traits_summary(
     model: Option<&Model>,
     reasoning: Option<ReasoningLevel>,
@@ -234,7 +238,17 @@ pub fn traits_summary(
         parts.push(reasoning_label(level).to_string());
     }
     if let Some(model) = model {
+        // The speed pick renders as the bolt icon beside the chip label, and
+        // context-window size reads on the picker's own option row — neither
+        // belongs in the compact suffix.
+        let speed_id =
+            crate::settings::loadout_model::speed_option(model).map(|option| option.id.as_str());
         for option in &model.options {
+            if Some(option.id.as_str()) == speed_id
+                || option.id.to_ascii_lowercase().contains("context")
+            {
+                continue;
+            }
             let choice_id = selections
                 .get(&option.id)
                 .and_then(|v| v.as_str())
@@ -257,6 +271,22 @@ pub fn traits_summary(
     } else {
         Some(parts.join(" · "))
     }
+}
+
+/// The active account's tightest usage window — the fraction the composer
+/// chip's ring shows. `None` when no account for the harness is active or
+/// none carry usage data.
+fn usage_fraction(
+    snapshot: &zeron_proto::AgentAccountsSnapshot,
+    harness: HarnessId,
+) -> Option<f32> {
+    snapshot
+        .accounts
+        .iter()
+        .filter(|account| account.harness == harness && account.active)
+        .flat_map(|account| account.usage_windows.iter())
+        .map(|window| window.used_fraction.clamp(0.0, 1.0))
+        .reduce(f32::max)
 }
 
 /// Keep only the picks `model` still offers. Remembered picks outlive the
@@ -543,6 +573,12 @@ pub struct Pickers {
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
     model_refresh_errors: HashMap<HarnessId, String>,
+    /// Provider-usage cache for the chip's ring: the harness it belongs to,
+    /// when it was fetched, and the active account's tightest window
+    /// fraction (`None` = fetched, no usage data to show).
+    usage: Option<(HarnessId, std::time::Instant, Option<f32>)>,
+    /// Harness a usage refresh is in flight for.
+    usage_pending: Option<HarnessId>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -735,6 +771,8 @@ impl Pickers {
             harnesses: Loadable::Idle,
             models: HashMap::new(),
             model_refresh_errors: HashMap::new(),
+            usage: None,
+            usage_pending: None,
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
@@ -1208,6 +1246,49 @@ impl Pickers {
             })
             .ok();
         }));
+    }
+
+    /// Provider usage for the chip ring. The engine only hits the provider on
+    /// a forced list and otherwise serves its 60s cache, so re-asking at that
+    /// cadence is free — a stale or never-fetched harness kicks one refresh
+    /// and the ring appears when the fraction lands.
+    fn refresh_usage(&mut self, cx: &mut Context<Self>) {
+        let Some(harness) = self.effective_harness(cx) else {
+            return;
+        };
+        if self.usage_pending == Some(harness)
+            || self
+                .usage
+                .as_ref()
+                .is_some_and(|(h, at, _)| *h == harness && at.elapsed() < Duration::from_secs(60))
+        {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.usage_pending = Some(harness);
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_AGENT_ACCOUNTS, serde_json::json!({}))
+                .await;
+            this.update(cx, |pickers, cx| {
+                if pickers.usage_pending == Some(harness) {
+                    pickers.usage_pending = None;
+                }
+                let fraction = result
+                    .ok()
+                    .and_then(|value| {
+                        serde_json::from_value::<zeron_proto::AgentAccountsSnapshot>(value).ok()
+                    })
+                    .and_then(|snapshot| usage_fraction(&snapshot, harness));
+                pickers.usage = Some((harness, std::time::Instant::now(), fraction));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Kick a model load for the effective harness AND every offered one, in
@@ -5060,18 +5141,21 @@ impl Render for Pickers {
                 traits_active.then(|| theme.text.opacity(0.85)),
             )
         });
-        let fast = self.selected_model(cx).is_some_and(|model| {
-            model.options.iter().any(|option| {
-                option.id == "serviceTier"
-                    && self
-                        .resolved(cx)
-                        .model_options
+        // Any provider speed toggle — Claude's serviceTier, Codex fast, the
+        // folded Grok/Devin `fast` option — lights the same bolt when its
+        // effective pick is the fast choice.
+        let fast = self
+            .selected_model(cx)
+            .and_then(|model| {
+                crate::settings::loadout_model::speed_option(model).map(|option| {
+                    let effective = explicit_options
                         .get(&option.id)
                         .and_then(|v| v.as_str())
-                        .unwrap_or(&option.default_choice)
-                        == "fast"
+                        .unwrap_or(&option.default_choice);
+                    crate::settings::loadout_model::speed_choice_id(option) == Some(effective)
+                })
             })
-        });
+            .unwrap_or(false);
         let model_chip = self
             .trigger_chip(
                 PickerKind::HarnessModel,
@@ -5101,6 +5185,26 @@ impl Render for Pickers {
             "model-popover",
             closing,
         );
+        // Provider usage as a quiet ring beside the chip (accent → amber ≥
+        // 80% → red ≥95%, the Accounts thresholds). The engine caches usage
+        // for 60s, so polling on that cadence rides the cache.
+        self.refresh_usage(cx);
+        let usage_ring = self
+            .usage
+            .as_ref()
+            .filter(|(harness, _, _)| Some(*harness) == self.effective_harness(cx))
+            .and_then(|(_, _, fraction)| *fraction)
+            .map(|fraction| {
+                crate::loaders::usage_ring(
+                    fraction,
+                    15.0,
+                    crate::settings::accounts::usage_color(
+                        crate::settings::accounts::usage_level(fraction),
+                        &theme,
+                    ),
+                    theme.text_muted.opacity(0.25),
+                )
+            });
         div()
             .flex()
             .flex_row()
@@ -5113,6 +5217,7 @@ impl Render for Pickers {
             .min_w_0()
             .gap(px(4.0))
             .child(model_chip)
+            .when_some(usage_ring, |el, ring| el.child(ring))
     }
 }
 
@@ -6581,16 +6686,103 @@ mod tests {
         let mut picks = serde_json::Map::new();
         picks.insert("serviceTier".into(), "default".into());
         assert_eq!(traits_summary(Some(&model), None, &picks), None);
+        // The speed pick is the bolt icon, not chip text.
         picks.insert("serviceTier".into(), "fast".into());
-        assert_eq!(
-            traits_summary(Some(&model), None, &picks),
-            Some("Fast".into())
-        );
-        model.options[0].id = "context".into();
+        assert_eq!(traits_summary(Some(&model), None, &picks), None);
+        model.options[0].id = "mode".into();
+        // A "fast" choice id or label would still mark it the speed option.
+        model.options[0].choices[1].id = "rapid".into();
+        model.options[0].choices[1].label = "Rapid".into();
         assert_eq!(
             traits_summary(Some(&model), None, &serde_json::Map::new()),
             Some("Standard".into())
         );
+    }
+
+    #[test]
+    fn traits_summary_drops_context_window_and_speed_options() {
+        let mut model = bare_model("test", "Test");
+        model.options = vec![
+            ModelOption {
+                id: "contextWindow".into(),
+                label: "Context window".into(),
+                choices: vec![
+                    ModelOptionChoice {
+                        id: "standard".into(),
+                        label: "Standard".into(),
+                    },
+                    ModelOptionChoice {
+                        id: "1m".into(),
+                        label: "1M".into(),
+                    },
+                ],
+                default_choice: "standard".into(),
+            },
+            ModelOption {
+                id: "fast".into(),
+                label: "Fast".into(),
+                choices: vec![
+                    ModelOptionChoice {
+                        id: "off".into(),
+                        label: "Off".into(),
+                    },
+                    ModelOptionChoice {
+                        id: "on".into(),
+                        label: "On".into(),
+                    },
+                ],
+                default_choice: "off".into(),
+            },
+        ];
+        let mut picks = serde_json::Map::new();
+        picks.insert("contextWindow".into(), "1m".into());
+        picks.insert("fast".into(), "on".into());
+        assert_eq!(traits_summary(Some(&model), None, &picks), None);
+        // A non-context, non-speed option still reads on the chip.
+        model.options.push(ModelOption {
+            id: "mode".into(),
+            label: "Mode".into(),
+            choices: vec![
+                ModelOptionChoice {
+                    id: "ask".into(),
+                    label: "Ask".into(),
+                },
+                ModelOptionChoice {
+                    id: "auto".into(),
+                    label: "Auto".into(),
+                },
+            ],
+            default_choice: "ask".into(),
+        });
+        assert_eq!(
+            traits_summary(Some(&model), None, &picks),
+            Some("Ask".into())
+        );
+    }
+
+    #[test]
+    fn usage_fraction_reads_the_active_account_tightest_window() {
+        let snapshot: zeron_proto::AgentAccountsSnapshot =
+            serde_json::from_value(serde_json::json!({
+                "accounts": [
+                    {"id": "g1", "harness": "grok", "active": true, "switchable": true,
+                     "usageWindows": [
+                        {"label": "5-hour", "usedFraction": 0.4},
+                        {"label": "Weekly", "usedFraction": 0.72}
+                     ]},
+                    {"id": "g2", "harness": "grok", "active": false, "switchable": true,
+                     "usageWindows": [{"label": "5-hour", "usedFraction": 0.99}]},
+                    {"id": "c1", "harness": "codex", "active": true, "switchable": true,
+                     "usageWindows": []}
+                ],
+                "warnings": []
+            }))
+            .unwrap();
+        // Active account, most-constrained window — the inactive 0.99 slot
+        // never leaks in.
+        assert_eq!(usage_fraction(&snapshot, HarnessId::Grok), Some(0.72));
+        assert_eq!(usage_fraction(&snapshot, HarnessId::Codex), None);
+        assert_eq!(usage_fraction(&snapshot, HarnessId::Devin), None);
     }
 
     #[test]
@@ -6602,8 +6794,8 @@ mod tests {
             reasoning_levels: vec![ReasoningLevel::Medium, ReasoningLevel::High],
             options: vec![
                 ModelOption {
-                    id: "context".into(),
-                    label: "Context window".into(),
+                    id: "memory".into(),
+                    label: "Memory".into(),
                     choices: vec![
                         ModelOptionChoice {
                             id: "standard".into(),
@@ -6617,16 +6809,16 @@ mod tests {
                     default_choice: "standard".into(),
                 },
                 ModelOption {
-                    id: "speed".into(),
-                    label: "Speed".into(),
+                    id: "mode".into(),
+                    label: "Mode".into(),
                     choices: vec![
                         ModelOptionChoice {
                             id: "normal".into(),
                             label: "Normal".into(),
                         },
                         ModelOptionChoice {
-                            id: "fast".into(),
-                            label: "Fast".into(),
+                            id: "rapid".into(),
+                            label: "Rapid".into(),
                         },
                     ],
                     default_choice: "normal".into(),
@@ -6634,11 +6826,11 @@ mod tests {
             ],
         };
         let mut selections = serde_json::Map::new();
-        selections.insert("context".into(), serde_json::Value::String("1m".into()));
-        selections.insert("speed".into(), serde_json::Value::String("fast".into()));
+        selections.insert("memory".into(), serde_json::Value::String("1m".into()));
+        selections.insert("mode".into(), serde_json::Value::String("rapid".into()));
         assert_eq!(
             traits_summary(Some(&model), Some(ReasoningLevel::High), &selections),
-            Some("High · 1M · Fast".to_string())
+            Some("High · 1M · Rapid".to_string())
         );
         // All defaults: the effective choices still read on the trigger.
         assert_eq!(
@@ -6648,23 +6840,17 @@ mod tests {
         // A saved choice the option no longer offers falls back to the default
         // label rather than vanishing or echoing a stale id.
         let mut stale = serde_json::Map::new();
-        stale.insert(
-            "speed".into(),
-            serde_json::Value::String("ludicrous".into()),
-        );
+        stale.insert("mode".into(), serde_json::Value::String("ludicrous".into()));
         assert_eq!(
             traits_summary(Some(&model), None, &stale),
             Some("Standard · Normal".to_string())
         );
         // Remembered picks drop what the model doesn't offer before sending.
         let mut remembered = selections.clone();
-        remembered.insert(
-            "speed".into(),
-            serde_json::Value::String("ludicrous".into()),
-        );
+        remembered.insert("mode".into(), serde_json::Value::String("ludicrous".into()));
         remembered.insert("fastMode".into(), serde_json::Value::String("on".into()));
         let mut want = serde_json::Map::new();
-        want.insert("context".into(), serde_json::Value::String("1m".into()));
+        want.insert("memory".into(), serde_json::Value::String("1m".into()));
         assert_eq!(offered_options(&model, remembered), want);
         // Reasoning shows without a model too.
         assert_eq!(

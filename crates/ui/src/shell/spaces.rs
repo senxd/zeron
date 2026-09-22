@@ -899,6 +899,49 @@ mod pinned_session_tests {
     }
 
     #[gpui::test]
+    fn group_header_plus_opens_a_new_session_in_that_project(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let window = pin_test_shell(cx, dir.path());
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_organization = SidebarOrganization::ByProject;
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.spaces = ["a", "b"]
+                        .into_iter()
+                        .map(|id| {
+                            serde_json::from_value(serde_json::json!({
+                                "id": id, "deviceId": "local", "path": format!("/project/{id}"), "createdAt": Utc::now()
+                            }))
+                            .unwrap()
+                        })
+                        .collect();
+                    let mut chat = pin_test_chat("existing");
+                    chat.space_id = Some("a".into());
+                    state.chats = vec![chat];
+                    state.selected_chat = Some("existing".into());
+                });
+                shell.open_new_session_in_group("project:b".into(), cx);
+                {
+                    let state = shell.state.read(cx);
+                    assert_eq!(state.selected_chat, None);
+                    assert_eq!(state.selected_space.as_deref(), Some("b"));
+                    assert!(!state.no_project);
+                }
+                // The project-less group targets a no-project session on the
+                // group's device.
+                shell.open_new_session_in_group("project:home:local".into(), cx);
+                let state = shell.state.read(cx);
+                assert_eq!(state.selected_space, None);
+                assert_eq!(state.selected_device.as_deref(), Some("local"));
+                assert!(state.no_project);
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     fn sidebar_remote_pins_ignore_old_local_preferences(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         let window = pin_test_shell(cx, dir.path());
@@ -1960,7 +2003,12 @@ pub(super) fn sidebar_separator(theme: &Theme) -> gpui::Div {
     div().h(px(1.0)).bg(theme.border.opacity(0.6))
 }
 
-fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyElement) -> gpui::Div {
+fn sidebar_disclosure_header(
+    theme: &Theme,
+    label: SharedString,
+    extra: Option<AnyElement>,
+    chevron: AnyElement,
+) -> gpui::Div {
     div()
         .flex()
         .flex_row()
@@ -1979,6 +2027,7 @@ fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyEle
                 .child(label),
         ))
         .child(div().flex_1())
+        .when_some(extra, |el, extra| el.child(extra))
         .child(chevron)
 }
 
@@ -4630,8 +4679,44 @@ impl Shell {
             let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
             let toggle_key = collapse_key.clone();
             let toggle_motion_key = motion_key.clone();
-            let header = sidebar_disclosure_header(theme, visible_label, chevron)
+            // Hover reveals a "+" left of the chevron: a new session bound to
+            // this group (the project, or the device for project-less/device
+            // groups) without touching the sidebar filter.
+            let new_chat_key = collapse_key.clone();
+            let plus =
+                (self.sidebar_group_hover.as_deref() == Some(collapse_key.as_str())).then(|| {
+                    div()
+                        .id(SharedString::from(format!(
+                            "sidebar-group-add-{collapse_key}"
+                        )))
+                        .debug_selector({
+                            let key = collapse_key.clone();
+                            move || format!("sidebar-group-add-{key}")
+                        })
+                        .size(px(20.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.0))
+                        .hover(|el| el.bg(theme.glass_hover()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_new_session_in_group(new_chat_key.clone(), cx);
+                            cx.stop_propagation();
+                        }))
+                        .child(
+                            icon(icons::PLUS)
+                                .size(px(13.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .into_any_element()
+                });
+            let hover_key = collapse_key.clone();
+            let header = sidebar_disclosure_header(theme, visible_label, plus, chevron)
                 .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.sidebar_group_hover = hovered.then(|| hover_key.clone());
+                    cx.notify();
+                }))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
                     this.begin_sidebar_disclosure_motion(
@@ -4676,6 +4761,38 @@ impl Shell {
         }
     }
 
+    /// "+" on a project/device group header: open the new-session canvas
+    /// bound to that group. `project:{space}` selects the space (the device's
+    /// pick follows it); `project:home:{device}` and `device:{device}` groups
+    /// target a project-less session on that device. The sidebar filter is
+    /// untouched — the canvas gets the group, the list stays put.
+    pub(super) fn open_new_session_in_group(&mut self, key: String, cx: &mut Context<Self>) {
+        self.command_palette = None;
+        self.route = Route::Chat;
+        self.focus_composer(cx);
+        self.state.update(cx, |s, cx| {
+            if let Some(space) = key.strip_prefix("project:") {
+                if let Some(device) = space.strip_prefix("home:") {
+                    s.select_device(device.to_string(), cx);
+                    s.select_space(None, cx);
+                } else {
+                    s.select_space(Some(space.to_string()), cx);
+                }
+            } else if let Some(device) = key.strip_prefix("device:") {
+                s.select_device(device.to_string(), cx);
+            }
+            s.select_chat(None, cx);
+        });
+        if let Some(slot) = self.settings.loadout.slot(0).cloned() {
+            self.composer.update(cx, |composer, cx| {
+                let _ = composer
+                    .pickers()
+                    .update(cx, |pickers, cx| pickers.apply_loadout_slot(&slot, cx));
+            });
+        }
+        cx.notify();
+    }
+
     pub(super) fn render_pinned_section(
         &mut self,
         items: Vec<AnyElement>,
@@ -4690,7 +4807,7 @@ impl Shell {
             format!("Pinned ({})", items.len()).into()
         };
         let chevron = self.sidebar_disclosure_chevron("pinned", open, theme);
-        let header = sidebar_disclosure_header(theme, label, chevron)
+        let header = sidebar_disclosure_header(theme, label, None, chevron)
             .id("pinned-toggle")
             .debug_selector(|| "pinned-toggle".into())
             .on_drag_move::<SidebarSessionDrag>(cx.listener(
@@ -4771,7 +4888,7 @@ impl Shell {
             format!("Sessions ({count})").into()
         };
         let chevron = self.sidebar_disclosure_chevron("sessions", open, theme);
-        let header = sidebar_disclosure_header(theme, label, chevron)
+        let header = sidebar_disclosure_header(theme, label, None, chevron)
             .id("sessions-toggle")
             .debug_selector(|| "sessions-toggle".into())
             .on_drag_move::<SidebarSessionDrag>(cx.listener(
@@ -4908,7 +5025,7 @@ impl Shell {
             format!("Archived ({total})").into()
         };
         let chevron = self.sidebar_disclosure_chevron("archived", open, theme);
-        let header = sidebar_disclosure_header(theme, label, chevron)
+        let header = sidebar_disclosure_header(theme, label, None, chevron)
             .id("archived-toggle")
             .on_click(cx.listener(move |this, _, _, cx| {
                 let was_open = this.archived_open;

@@ -1610,6 +1610,9 @@ pub struct Shell {
     section_dialog: Option<sidebar_sections::SectionDialog>,
     section_menu: Option<(String, Point<Pixels>)>,
     section_header_hover: Option<String>,
+    /// Sidebar project/device group header under the pointer — reveals the
+    /// "new chat here" plus button.
+    sidebar_group_hover: Option<String>,
     section_menu_focus: FocusHandle,
     section_menu_active: Option<usize>,
     /// Space id awaiting delete confirmation (hard delete + session cascade).
@@ -2032,6 +2035,7 @@ impl Shell {
             section_dialog: None,
             section_menu: None,
             section_header_hover: None,
+            sidebar_group_hover: None,
             section_menu_focus: cx.focus_handle(),
             section_menu_active: None,
             delete_space_confirm: None,
