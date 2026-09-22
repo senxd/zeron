@@ -589,10 +589,7 @@ pub fn relaunch_app_after_exit(bundle: &Path) {
     {
         use std::os::unix::process::CommandExt as _;
         let pid = std::process::id();
-        let script = format!(
-            "while /bin/kill -0 {pid} 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"{}\"",
-            bundle.display()
-        );
+        let script = relaunch_script(pid, bundle);
         let mut command = std::process::Command::new("/bin/sh");
         command
             .args(["-c", &script])
@@ -606,6 +603,23 @@ pub fn relaunch_app_after_exit(bundle: &Path) {
     }
     #[cfg(not(unix))]
     let _ = bundle;
+}
+
+/// The detached relaunch script. After the GUI exits, kickstart the headless
+/// engine service before `open` so it respawns from the swapped bundle — it
+/// outlives GUI relaunches and would otherwise keep serving the pre-update
+/// binary (and the pre-update `current_version` on the update strip). A
+/// missing `sh.zeron.app` service (embedded-engine setups) makes `kickstart`
+/// a no-op. Reopening can race the engine's rebind; `EngineHandle::bootstrap`
+/// re-probes while the daemon holds the instance lock mid-start.
+#[cfg(unix)]
+fn relaunch_script(pid: u32, bundle: &Path) -> String {
+    format!(
+        "while /bin/kill -0 {pid} 2>/dev/null; do sleep 0.2; done; \
+         /bin/launchctl kickstart -k gui/$(/usr/bin/id -u)/sh.zeron.app 2>/dev/null; \
+         /usr/bin/open \"{}\"",
+        bundle.display()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -853,6 +867,20 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn relaunch_script_waits_then_kickstarts_engine_then_reopens() {
+        let script = relaunch_script(42, Path::new("/Applications/Zeron.app"));
+        let wait = script.find("kill -0 42").expect("exit wait");
+        let kickstart = script
+            .find("launchctl kickstart -k gui/$(/usr/bin/id -u)/sh.zeron.app")
+            .expect("engine kickstart");
+        let open = script
+            .find("/usr/bin/open \"/Applications/Zeron.app\"")
+            .expect("reopen");
+        assert!(wait < kickstart && kickstart < open, "{script}");
+    }
 
     #[tokio::test]
     async fn stalled_update_headers_and_body_time_out_but_progressing_body_survives() {
