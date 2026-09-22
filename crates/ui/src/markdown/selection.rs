@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn set_spans_installs_a_settled_selection() {
-        let _state = state_lock();
+        let _state = test_state_lock();
         clear();
         set_spans(vec![Span {
             key: "p1".into(),

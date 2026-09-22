@@ -34,10 +34,10 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Entity, Focusable,
-    ListAlignment,
-    ListOffset, ListScrollEvent, ListState, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PathBuilder, Pixels, Point, SharedString, StyledImage as _, StyledText, Subscription, Task,
-    TextAlign, TextRun, Window, canvas, div, img, list, point, prelude::*, px, quad, size,
+    ListAlignment, ListOffset, ListScrollEvent, ListState, MouseButton, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, PathBuilder, Pixels, Point, SharedString, StyledImage as _,
+    StyledText, Subscription, Task, TextAlign, TextRun, Window, canvas, div, img, list, point,
+    prelude::*, px, quad, size,
 };
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};

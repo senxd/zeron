@@ -540,11 +540,10 @@ pub async fn install_harness(harness: HarnessId) -> Result<(), HarnessError> {
     Ok(())
 }
 
-/// the user-global skill folders the server loads (`resolve_skills_paths`).
-/// its project-level `.gemini/skills` and `.agents/skills` depend on a session
-/// cwd the command listing doesn't have, so those still reach the agent when
-/// typed but aren't listed.
-fn antigravity_skill_dirs() -> Vec<PathBuf> {
+/// User-global skill folders the server loads (`resolve_skills_paths`).
+/// Shared discovery adds project `.gemini/skills` and `.agents/skills` using
+/// the selected session's cwd.
+pub(crate) fn antigravity_skill_dirs() -> Vec<PathBuf> {
     antigravity_paths::home()
         .map(|home| {
             vec![
@@ -882,6 +881,7 @@ pub struct AcpHarness {
     pi_models_cache: tokio::sync::Mutex<HashMap<PathBuf, Vec<Model>>>,
     /// Coalesce concurrent picker probes.
     models_probe: tokio::sync::Mutex<()>,
+    workspace_commands: crate::skills::CommandDiscovery,
     devin_models: devin_models::Catalog,
 }
 
@@ -902,6 +902,7 @@ impl AcpHarness {
             models_cache: crate::catalog::Catalog::default(),
             pi_models_cache: tokio::sync::Mutex::new(HashMap::new()),
             models_probe: tokio::sync::Mutex::new(()),
+            workspace_commands: crate::skills::CommandDiscovery::default(),
             devin_models: devin_models::Catalog::default(),
         }
     }
@@ -1322,8 +1323,13 @@ impl AcpHarness {
     /// briefly for `available_commands_update`. Best-effort — an agent that
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (_scratch, mut child, _stderr) = self.spawn_agent(None, false, &[]).await?;
+    async fn discover_commands(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
+        let (_scratch, mut child, _stderr) = self
+            .spawn_agent(cwd.and_then(|p| p.to_str()), false, &[])
+            .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1336,8 +1342,10 @@ impl AcpHarness {
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
             let mut commands = scan_available_commands(&init);
-            if commands.is_empty() {
-                let cwd = crate::executable::home_or_current_dir();
+            {
+                let cwd = cwd
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(crate::executable::home_or_current_dir);
                 let session = client
                     .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                     .await;
@@ -2064,15 +2072,45 @@ impl Harness for AcpHarness {
         }
     }
 
-    /// the agent's advertised commands minus the spec's hidden ones, then its
-    /// skills. Skills are read fresh on every call so a newly added one shows
-    /// up, and they still list when discovery fails (a signed-out agent).
+    async fn skills(
+        &self,
+        cwd: &std::path::Path,
+    ) -> Result<Option<Vec<zeron_proto::invocation::Skill>>, HarnessError> {
+        let (mut skills, commands) = tokio::try_join!(
+            crate::skills::discover(self.id(), cwd),
+            self.workspace_commands
+                .get(cwd, self.discover_commands(Some(cwd))),
+        )?;
+        crate::skills::attach_advertised_commands(self.id(), &mut skills, &commands);
+        Ok(Some(skills))
+    }
+
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         let discovered = self
             .commands
-            .get_or_try_init(|| self.discover_commands())
+            .get_or_try_init(|| self.discover_commands(None))
             .await
             .cloned();
+        let skills = skill_commands(&(self.spec.skill_dirs)());
+        let mut commands = match discovered {
+            Ok(commands) => commands,
+            Err(_) if !skills.is_empty() => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        commands.retain(|command| !self.spec.hidden_commands.contains(&command.name.as_str()));
+        for skill in skills {
+            if !commands.iter().any(|command| command.name == skill.name) {
+                commands.push(skill);
+            }
+        }
+        Ok(commands)
+    }
+
+    async fn commands_for(&self, cwd: &std::path::Path) -> Result<Vec<SlashCommand>, HarnessError> {
+        let discovered = self
+            .workspace_commands
+            .get(cwd, self.discover_commands(Some(cwd)))
+            .await;
         let skills = skill_commands(&(self.spec.skill_dirs)());
         let mut commands = match discovered {
             Ok(commands) => commands,
@@ -2093,6 +2131,31 @@ impl Harness for AcpHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mut request = request;
+        // The picker shows folded catalog ids (a family uid, or `fusion`):
+        // resolve the run's model + reasoning + option picks back to the
+        // exact variant uid the session advertises. Legacy variant uids pass
+        // through; a combination Devin doesn't offer fails before spawn.
+        if self.spec.id == HarnessId::Devin
+            && let Some(model) = request.model.clone()
+            && let Ok((exe, _)) = self.resolve_program(false).await
+        {
+            match self
+                .devin_models
+                .resolve(
+                    &exe,
+                    self.model_discovery_timeout,
+                    &model,
+                    request.reasoning,
+                    &request.model_options,
+                )
+                .await
+            {
+                Ok(devin_models::Resolution::Variant(uid)) => request.model = Some(uid),
+                Ok(devin_models::Resolution::PassThrough) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let (scratch, mut child, stderr_tail) =
             self.spawn_agent(Some(&request.cwd), true, &[]).await?;
         let stdin = child

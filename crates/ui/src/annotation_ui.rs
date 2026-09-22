@@ -69,64 +69,56 @@ pub(crate) fn mini_composer<T: 'static>(
                     dismiss_escape(this, cx);
                 }
             }))
-            .child(composer_pill(
-                theme,
-                36.0,
-                {
-                    const CLOSE: f32 = 24.0;
-                    const INSET: f32 = 6.0;
-                    div()
-                        .w(px(280.0))
-                        .h(px(CLOSE + INSET * 2.0))
-                        .flex()
-                        .items_center()
-                        .overflow_hidden()
-                        .pl(px(14.0))
-                        .pr(px(INSET))
-                        .gap(px(8.0))
-                        .text_size(px(13.0))
-                        .text_color(theme.text)
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .h(px(CLOSE))
-                                .flex()
-                                .items_center()
-                                .overflow_hidden()
-                                .child(input.clone()),
-                        )
-                        .child(
-                            div()
-                                .id("annotation-delete")
-                                .role(gpui::Role::Button)
-                                .aria_label("Delete annotation")
-                                .flex_none()
-                                .size(px(CLOSE))
-                                .rounded_full()
-                                .bg(crate::theme::ink(0.08))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .hover(|s| {
-                                    s.bg(crate::theme::ink(0.14)).text_color(theme.text)
-                                })
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation()
-                                })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    delete_click(this, cx);
-                                }))
-                                .child(
-                                    crate::icons::icon(crate::icons::CLOSE)
-                                        .size(px(12.0))
-                                        .text_color(theme.text_muted),
-                                ),
-                        )
-                },
-            ))
+            .child(composer_pill(theme, 36.0, {
+                const CLOSE: f32 = 24.0;
+                const INSET: f32 = 6.0;
+                div()
+                    .w(px(280.0))
+                    .h(px(CLOSE + INSET * 2.0))
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .pl(px(14.0))
+                    .pr(px(INSET))
+                    .gap(px(8.0))
+                    .text_size(px(13.0))
+                    .text_color(theme.text)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(CLOSE))
+                            .flex()
+                            .items_center()
+                            .overflow_hidden()
+                            .child(input.clone()),
+                    )
+                    .child(
+                        div()
+                            .id("annotation-delete")
+                            .role(gpui::Role::Button)
+                            .aria_label("Delete annotation")
+                            .flex_none()
+                            .size(px(CLOSE))
+                            .rounded_full()
+                            .bg(crate::theme::ink(0.08))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(crate::theme::ink(0.14)).text_color(theme.text))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                delete_click(this, cx);
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::CLOSE)
+                                    .size(px(12.0))
+                                    .text_color(theme.text_muted),
+                            ),
+                    )
+            }))
             .into_any_element(),
     )
 }

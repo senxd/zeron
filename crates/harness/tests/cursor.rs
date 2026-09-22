@@ -497,6 +497,7 @@ async fn cancelling_a_saturated_steering_queue_never_starts_queued_turns() {
         .unwrap();
         assert_eq!(dones, 1);
     }
+}
 
 #[tokio::test]
 async fn reasoning_is_sent_as_cursor_effort() {

@@ -132,7 +132,6 @@ impl Shell {
         let live = state
             .chats
             .iter()
-            .filter(|chat| !chat.archived)
             .map(|chat| chat.id.as_str())
             .collect::<std::collections::HashSet<_>>();
         for key in self.files.keys().filter(|key| !live.contains(key.as_str())) {
@@ -494,9 +493,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn pane_toggle_drives_surfaces_only_and_last_tab_close_collapses_them(
-        cx: &mut TestAppContext,
-    ) {
+    fn pane_toggle_drives_surfaces_only_and_last_tab_close_collapses_them(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             gpui_base::init(cx);
