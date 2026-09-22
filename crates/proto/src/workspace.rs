@@ -14,6 +14,9 @@ pub mod capabilities {
     pub const MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1: &str =
         "message-queue-clean-attachment-text-v1";
     pub const MESSAGE_QUEUE_EDIT_LEASE_V1: &str = "message-queue-edit-lease-v1";
+    /// Engine-local scheduled prompts: `SchedulePrompt` / `DeleteScheduledPrompt` /
+    /// `RunScheduledPromptNow` calls and the `WatchScheduledPrompts` stream.
+    pub const SCHEDULED_PROMPTS_V1: &str = "scheduled-prompts-v1";
 
     pub const CURRENT: &[&str] = &[
         COMPOSER_REFERENCES_V1,
@@ -22,6 +25,7 @@ pub mod capabilities {
         MESSAGE_QUEUE_ATTACHMENTS_V1,
         MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
         MESSAGE_QUEUE_EDIT_LEASE_V1,
+        SCHEDULED_PROMPTS_V1,
     ];
 
     pub fn current() -> Vec<String> {
@@ -100,7 +104,8 @@ mod tests {
                     "message-queue-actions-v1",
                     "message-queue-attachments-v1",
                     "message-queue-clean-attachment-text-v1",
-                    "message-queue-edit-lease-v1"
+                    "message-queue-edit-lease-v1",
+                    "scheduled-prompts-v1"
                 ],
             })
         );

@@ -32,6 +32,7 @@ pub mod registry;
 pub mod repos;
 pub mod rpc;
 pub mod run_journal;
+pub mod scheduled_prompts;
 pub mod sessions;
 pub mod source_control;
 pub mod spaces;
@@ -58,6 +59,7 @@ pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
+pub use scheduled_prompts::ScheduledPrompts;
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
 pub use source_control::{
     BranchHeadContext, ChangeRequestError, ChangeRequestProvider, ChangeRequestResolution,
@@ -139,6 +141,8 @@ pub struct EngineCore {
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
+    /// Engine-local scheduled prompts (personal-fork feature).
+    pub scheduled_prompts: ScheduledPrompts,
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
@@ -310,6 +314,9 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        let scheduled_prompts =
+            ScheduledPrompts::open(profile.store_root(), workspace.clone(), doc_host.clone())?;
+        sessions.set_agent_accounts(agent_accounts.clone());
         Ok(Self {
             sessions,
             doc_host,
@@ -325,6 +332,7 @@ impl EngineCore {
             spaces_sync,
             uploads,
             agent_accounts,
+            scheduled_prompts,
             device_id,
             local_import,
             workspace_scope: profile.scope(),
@@ -456,6 +464,7 @@ impl EngineCore {
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
+            self.scheduled_prompts.clone(),
             self.workspace_scope,
         )
         .with_auth(self.auth())
@@ -520,6 +529,7 @@ impl EngineCore {
         self.diff_sync.shutdown().await;
         self.workspace_files.shutdown().await;
         self.spaces_sync.shutdown().await;
+        self.scheduled_prompts.shutdown().await;
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
         self.workspace.shutdown();

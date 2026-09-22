@@ -61,8 +61,8 @@ use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{
-    ChatConfig, CreateWorktreeOutcome, EngineInfo, HarnessId, ProjectActionDraft, Space, ToolCall,
-    WorkspaceScope,
+    ChatConfig, CreateWorktreeOutcome, EngineInfo, HarnessId, ProjectActionDraft,
+    ScheduledPromptDraft, Space, ToolCall, WorkspaceScope,
 };
 use zeron_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -208,6 +208,12 @@ struct FinishQueuedMessageEditParams {
     expected_text_hash: Option<String>,
     #[serde(default)]
     attachments: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScheduledPromptIdParams {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -544,6 +550,7 @@ pub struct EngineRpc {
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
     agent_accounts: AgentAccounts,
+    scheduled_prompts: crate::ScheduledPrompts,
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<zeron_update::Updater>,
@@ -566,6 +573,7 @@ impl EngineRpc {
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
+        scheduled_prompts: crate::ScheduledPrompts,
         workspace_scope: WorkspaceScope,
     ) -> Self {
         let engine_info = EngineInfo {
@@ -588,6 +596,7 @@ impl EngineRpc {
             diff_sync,
             uploads,
             agent_accounts,
+            scheduled_prompts,
             auth: None,
             links: None,
             updater: None,
@@ -2700,6 +2709,38 @@ impl RpcService for EngineRpc {
                 .map_err(|err| RpcError::Failed(err.to_string()))?;
                 RpcReply::value(&run)
             }
+            // Scheduled prompts (personal-fork feature): engine-local store on
+            // whichever engine this IPC/relay connection reaches — NOT
+            // `targetDeviceId`-forwardable (a remote engine's schedules are
+            // its own; a schedule's chat may still be remote-hosted at fire).
+            methods::SCHEDULE_PROMPT => {
+                let draft: ScheduledPromptDraft = parse_params(params)?;
+                let item = self
+                    .scheduled_prompts
+                    .schedule(draft)
+                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&item)
+            }
+            methods::DELETE_SCHEDULED_PROMPT => {
+                let p: ScheduledPromptIdParams = parse_params(params)?;
+                let deleted = self
+                    .scheduled_prompts
+                    .delete(&p.id)
+                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "deleted": deleted }))
+            }
+            methods::RUN_SCHEDULED_PROMPT_NOW => {
+                let p: ScheduledPromptIdParams = parse_params(params)?;
+                let item = self
+                    .scheduled_prompts
+                    .run_now(&p.id)
+                    .await
+                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&item)
+            }
+            methods::WATCH_SCHEDULED_PROMPTS => Ok(RpcReply::Stream(watch_stream(
+                self.scheduled_prompts.watch(),
+            ))),
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
                 // The terminal runs in the chat's checkout; a chat with no cwd (or

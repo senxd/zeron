@@ -33,7 +33,8 @@ use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use zeron_proto::{
     AuthState, ChangeRequestSummary, Chat, ChatIndicator, CheckoutChangeRequestStatus, Device,
-    EngineInfo, HarnessId, Session, SidebarPreferencesState, Space, WorkspaceScope,
+    EngineInfo, HarnessId, ScheduledPrompt, Session, SidebarPreferencesState, Space,
+    WorkspaceScope,
 };
 use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
@@ -678,6 +679,10 @@ pub struct AppState {
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
+    /// Engine-local scheduled prompts (personal feature) — the
+    /// `WatchScheduledPrompts` frame: pending by fire time, then terminal
+    /// rows newest-first.
+    pub scheduled_prompts: Vec<ScheduledPrompt>,
     /// Synced user/org sidebar pin state. Local workspaces deliberately ignore
     /// this and continue reading their device-local settings entry.
     pub sidebar_preferences: SidebarPreferencesState,
@@ -803,6 +808,7 @@ impl AppState {
             spaces: Vec::new(),
             chats: Vec::new(),
             sessions: Vec::new(),
+            scheduled_prompts: Vec::new(),
             sidebar_preferences: SidebarPreferencesState::default(),
             session_presentation: None,
             selected_space: None,
@@ -1014,6 +1020,14 @@ impl AppState {
             self.queue.clear();
             self.queue_task = None;
         }
+    }
+
+    /// `WatchScheduledPrompts` frame — the scheduler's rendered ordering is
+    /// kept verbatim.
+    pub fn apply_scheduled_prompts(&mut self, prompts: Vec<ScheduledPrompt>) -> bool {
+        let changed = self.scheduled_prompts != prompts;
+        self.scheduled_prompts = prompts;
+        changed
     }
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) -> bool {
@@ -1839,6 +1853,7 @@ impl AppState {
         self.spaces.clear();
         self.chats.clear();
         self.sessions.clear();
+        self.scheduled_prompts.clear();
         self.sidebar_preferences = SidebarPreferencesState::default();
         self.session_presentation = None;
         self.selected_space = None;
@@ -1957,6 +1972,12 @@ impl AppState {
                 state.apply_spaces(value);
                 true
             }),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_SCHEDULED_PROMPTS,
+                |state, value| state.apply_scheduled_prompts(value),
+            ),
             // Auth frames parse tolerantly — engine and proto tags differ today.
             spawn_watch(cx, handle.clone(), methods::AUTH_STATUS, |state, value| {
                 state.apply_auth_value(value);

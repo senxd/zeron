@@ -1473,6 +1473,41 @@ impl AgentAccounts {
 
     // ── remaining usage ─────────────────────────────────────────────────────
 
+    /// Devin quota reset hint for the sessions engine's rate-limit
+    /// auto-continue (personal-fork feature). Forces a fresh probe. When any
+    /// window reads exhausted the binding constraint is its LATEST reset (a
+    /// run resumes only once every exhausted bucket has refilled); with no
+    /// exhausted window the soonest reset is the earliest quota refresh.
+    pub async fn devin_quota_reset(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let snapshot = self.list(true).await.ok()?;
+        let now = chrono::Utc::now();
+        let account = snapshot
+            .accounts
+            .iter()
+            .find(|a| a.harness == HarnessId::Devin && a.active)
+            .or_else(|| {
+                snapshot
+                    .accounts
+                    .iter()
+                    .find(|a| a.harness == HarnessId::Devin)
+            })?;
+        let exhausted = account
+            .usage_windows
+            .iter()
+            .filter(|w| w.used_fraction >= 0.99)
+            .filter_map(|w| w.resets_at)
+            .filter(|t| *t > now)
+            .max();
+        exhausted.or_else(|| {
+            account
+                .usage_windows
+                .iter()
+                .filter_map(|w| w.resets_at)
+                .filter(|t| *t > now)
+                .min()
+        })
+    }
+
     async fn usage_for(
         &self,
         harness: HarnessId,

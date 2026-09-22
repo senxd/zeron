@@ -168,6 +168,17 @@ pub mod methods {
     pub const UPSERT_PROJECT_ACTION: &str = "UpsertProjectAction";
     pub const DELETE_PROJECT_ACTION: &str = "DeleteProjectAction";
     pub const RUN_PROJECT_ACTION: &str = "RunProjectAction";
+    // Scheduled prompts are private state on the engine that created them —
+    // IPC-only (a remote engine's schedules are its own). Watch emits the
+    // full `ScheduledPrompt` list, current value first.
+    /// `{ScheduledPromptDraft}` → the scheduled row.
+    pub const SCHEDULE_PROMPT: &str = "SchedulePrompt";
+    /// `{id}` → `{deleted}`.
+    pub const DELETE_SCHEDULED_PROMPT: &str = "DeleteScheduledPrompt";
+    /// `{id}` → fires a pending row immediately → the updated row.
+    pub const RUN_SCHEDULED_PROMPT_NOW: &str = "RunScheduledPromptNow";
+    /// No params → stream of `Vec<ScheduledPrompt>` (current first).
+    pub const WATCH_SCHEDULED_PROMPTS: &str = "WatchScheduledPrompts";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";

@@ -1130,6 +1130,81 @@ pub struct ChatConnectivity {
     pub pending_pushes: u64,
 }
 
+// ── Scheduled prompts (personal-fork feature) ──────────────────────────────
+//
+// Engine-local records (a JSON file under the profile store root — NOT a
+// synced doc): the engine that owns the store fires them, headed or
+// headless. Firing writes the same rows a composer send would — a `createChat`
+// upsert for a scheduled NEW session, then a durable `Run` command — so a
+// remote-hosted space still works through the ordinary command plane.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScheduledPromptStatus {
+    Pending,
+    /// The Run command was durably queued (or the chat created + queued).
+    Fired,
+    /// Firing failed (e.g. the target space is gone). Terminal — the row is
+    /// kept so the failure is visible; deleting it clears it.
+    Failed,
+}
+
+/// The `createChat` half of a scheduled send, present only when the target
+/// session does not exist yet. Materialized at fire time (idempotent by the
+/// pre-minted `ScheduledPrompt::chat_id`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledChatCreate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    /// Host for a project-less session; ignored when `space_id` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<ChatConfig>,
+}
+
+/// What `SchedulePrompt` accepts and `WatchScheduledPrompts` reports. The
+/// `request` is the literal `Run` payload — the composer resolves model /
+/// reasoning / options at schedule time exactly like a direct send.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledPrompt {
+    pub id: String,
+    /// Target chat: an existing row's id, or the pre-minted id `create`
+    /// materializes. Stable across a crash mid-fire so a re-fire dedupes.
+    pub chat_id: String,
+    /// Client-minted user-message id — reused on every fire attempt so the
+    /// transcript entry dedupes by id.
+    pub message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create: Option<ScheduledChatCreate>,
+    pub request: crate::RunRequest,
+    pub run_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub status: ScheduledPromptStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fired_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `SchedulePrompt` params: everything but the engine-owned ids/status.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduledPromptDraft {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create: Option<ScheduledChatCreate>,
+    pub request: crate::RunRequest,
+    pub run_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -130,6 +130,12 @@ struct RoutedSteer {
     message_id: String,
 }
 
+/// A parked Devin rate-limit auto-resume (personal-fork feature): the spawned
+/// delayed re-dispatch. Any new dispatch or an interrupt claims the chat back.
+struct RateLimitResume {
+    task: tokio::task::JoinHandle<()>,
+}
+
 struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
@@ -159,6 +165,14 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// Account usage probes (Devin quota reset times) — wired at engine
+    /// assembly; absent in bare tests (auto-resume then falls back to the
+    /// default retry delay).
+    agent_accounts: OnceLock<crate::agent_accounts::AgentAccounts>,
+    /// Devin runs parked on a usage-limit wait: chat_id → delayed re-dispatch.
+    rate_limit_resumes: Mutex<HashMap<String, RateLimitResume>>,
+    /// Consecutive auto-resumes spent per chat — cleared on a Completed turn.
+    rate_limit_attempts: Mutex<HashMap<String, u32>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -195,6 +209,9 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                agent_accounts: OnceLock::new(),
+                rate_limit_resumes: Mutex::new(HashMap::new()),
+                rate_limit_attempts: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -234,6 +251,12 @@ impl SessionsEngine {
     /// Wire the turn-start listener (called once at engine assembly).
     pub fn set_turn_listener(&self, listener: TurnListener) {
         let _ = self.inner.turn_listener.set(listener);
+    }
+
+    /// Wire the account usage probes (called once at engine assembly) — the
+    /// Devin rate-limit auto-resume reads quota reset times from here.
+    pub fn set_agent_accounts(&self, accounts: crate::agent_accounts::AgentAccounts) {
+        let _ = self.inner.agent_accounts.set(accounts);
     }
 
     fn note_turn_start(&self, chat_id: &str, cwd: &str) {
@@ -358,6 +381,8 @@ impl SessionsEngine {
         mut message_id: Option<String>,
         startup_retry: bool,
     ) -> Result<String, EngineError> {
+        // A user-driven dispatch supersedes a parked rate-limit auto-resume.
+        self.inner.cancel_rate_limit_resume(chat_id);
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
@@ -812,6 +837,11 @@ impl SessionsEngine {
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
     pub async fn shutdown(&self) {
+        // Parked rate-limit resumes die with the runtime — the chat stays
+        // Errored and the user can resume manually after restart.
+        for (_, resume) in lock(&self.inner.rate_limit_resumes).drain() {
+            resume.task.abort();
+        }
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in chats {
             if let Err(err) = self.interrupt(&chat_id).await {
@@ -1139,6 +1169,14 @@ impl Inner {
             }
         }
         found
+    }
+
+    /// Abort a parked rate-limit auto-resume — called by `dispatch_inner` so a
+    /// user send always wins over the delayed re-dispatch.
+    fn cancel_rate_limit_resume(&self, chat_id: &str) {
+        if let Some(resume) = lock(&self.rate_limit_resumes).remove(chat_id) {
+            resume.task.abort();
+        }
     }
 
     fn remove_run(&self, chat_id: &str, run_id: &str) {
@@ -1607,6 +1645,10 @@ async fn drive_run(
     let mut interrupt_deadline: Option<tokio::time::Instant> = None;
     let mut interrupted = false;
     let mut saw_session_started = false;
+    // Latest `Error` event text this run — `Done{Errored}` often carries a
+    // terse wire error while the useful "quota exhausted" detail arrives in
+    // the Error event just before it.
+    let mut last_error_text: Option<String> = None;
     // Liveness heartbeat: this loop RUNNING is proof the harness stream is
     // open, so freshness must not depend on events arriving. Silent stretches
     // are normal and UNBOUNDED — a long tool call, redacted thinking, an
@@ -2293,6 +2335,9 @@ async fn drive_run(
             AgentEvent::InputResolved { .. } => {
                 inner.set_status(&chat_id, SessionStatus::Working, false);
             }
+            AgentEvent::Error { message } => {
+                last_error_text = Some(message.clone());
+            }
             _ => {}
         }
 
@@ -2311,7 +2356,7 @@ async fn drive_run(
             // still in place and tested.
         }
 
-        if let AgentEvent::Done { status, .. } = &event {
+        if let AgentEvent::Done { status, error, .. } = &event {
             // A question still pending at turn end can never be legitimately
             // answered (its turn is over): drain the resolvers NOW, or a late
             // `respond_input` finds one, emits InputResolved, and un-parks
@@ -2362,6 +2407,8 @@ async fn drive_run(
                 // A cleanly completed turn resets the auto-resume revival
                 // budget: only consecutive crash-revive-crash cycles spend it.
                 inner.journal.clear_resume_attempts(&chat_id);
+                // Same for the rate-limit auto-resume budget.
+                lock(&inner.rate_limit_attempts).remove(&chat_id);
             }
             // Exchange completed on an untitled chat → name it (fire-and-forget;
             // interrupted/errored turns never trigger naming).
@@ -2398,6 +2445,15 @@ async fn drive_run(
                     completed_turn,
                 );
                 continue;
+            }
+            // Devin rate-limit auto-continue (personal-fork feature): a run
+            // that ERRORED on a usage/quota limit — never a user interrupt —
+            // parks a delayed re-dispatch until the quota window resets.
+            if *status == DoneStatus::Errored && !interrupted && harness_id == HarnessId::Devin {
+                let detail = error.clone().or_else(|| last_error_text.clone());
+                if detail.as_deref().is_some_and(is_devin_rate_limit) {
+                    schedule_rate_limit_resume(&inner, &chat_id, &entry_id, &doc);
+                }
             }
             final_completed_turn = completed_turn;
             break match status {
@@ -2488,8 +2544,191 @@ async fn drive_run(
     }
 }
 
+// ── Devin rate-limit auto-resume (personal-fork feature) ─────────────────────
+
+/// Consecutive auto-resumes per chat before giving up (each parks until the
+/// quota reset, so the ceiling bounds wasted wakes, not wall-clock).
+const MAX_RATE_LIMIT_RESUMES: u32 = 4;
+/// When the quota probe can't name a reset time.
+const RATE_LIMIT_RETRY_FALLBACK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// Never park a resume further out than a day.
+const RATE_LIMIT_RESUME_MAX_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+/// Wait a beat past the reset so the server-side window has actually rolled.
+const RATE_LIMIT_RESET_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether an error detail reads as a provider rate/usage limit. Devin
+/// surfaces these as JSON-RPC errors (`code 429`) and ACP `stopReason:
+/// "error"` payloads whose text names the quota — match the vocabulary, not
+/// a single wire shape. Deliberately conservative: a false positive only
+/// costs a delayed re-dispatch, a false negative leaves the user stranded.
+fn is_devin_rate_limit(detail: &str) -> bool {
+    let text = detail.to_lowercase();
+    const NEEDLES: &[&str] = &[
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "rate-limit",
+        "429",
+        "too many requests",
+        "quota",
+        "usage limit",
+        "limit reached",
+        "limit exceeded",
+        "insufficient",
+    ];
+    NEEDLES.iter().any(|needle| text.contains(needle))
+}
+
+/// Park a delayed re-dispatch for a Devin run that died on a usage limit.
+/// The wait resolves the quota reset via `AgentAccounts` (probing live
+/// usage), writes a visible note on the errored assistant entry, sleeps,
+/// then re-dispatches the LAST user prompt under its own message id (the
+/// doc dedupes user rows by id, so a retry never forks the transcript).
+/// Bounded by `rate_limit_attempts`; superseded by any user dispatch
+/// (`dispatch_inner` aborts the parked task) and cleared on Completed.
+fn schedule_rate_limit_resume(
+    inner: &Arc<Inner>,
+    chat_id: &str,
+    entry_id: &str,
+    doc: &Arc<SessionDoc>,
+) {
+    if lock(&inner.rate_limit_resumes).contains_key(chat_id) {
+        return; // one parked resume per chat
+    }
+    {
+        let mut attempts = lock(&inner.rate_limit_attempts);
+        let attempt = attempts.entry(chat_id.to_string()).or_insert(0);
+        *attempt += 1;
+        if *attempt > MAX_RATE_LIMIT_RESUMES {
+            tracing::warn!(chat = %chat_id, "rate-limit auto-resume budget exhausted");
+            return;
+        }
+    }
+    let inner2 = inner.clone();
+    let chat = chat_id.to_string();
+    let entry = entry_id.to_string();
+    let doc = doc.clone();
+    let task = tokio::spawn(async move {
+        // Resolve the resume time BEFORE writing the note so the transcript
+        // can say "at H:MM" rather than "later".
+        let reset = match inner2.agent_accounts.get() {
+            Some(accounts) => accounts.devin_quota_reset().await,
+            None => None,
+        };
+        let delay = reset
+            .and_then(|at| (at - chrono::Utc::now()).to_std().ok())
+            .map(|d| d + RATE_LIMIT_RESET_GRACE)
+            .unwrap_or(RATE_LIMIT_RETRY_FALLBACK)
+            .min(RATE_LIMIT_RESUME_MAX_DELAY);
+        let note = if delay >= std::time::Duration::from_secs(3600) {
+            let when = (chrono::Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default())
+                .with_timezone(&chrono::Local)
+                .format("%b %-d, %-I:%M %p");
+            format!("Devin usage limit reached — auto-resuming at {when}.")
+        } else {
+            format!(
+                "Devin usage limit reached — auto-resuming in {}m.",
+                delay.as_secs().div_ceil(60)
+            )
+        };
+        if let Err(err) = doc.append_error_part(&entry, &format!("{entry}-quota"), &note) {
+            tracing::warn!(chat = %chat, error = %err, "rate-limit note write failed");
+        }
+        tokio::time::sleep(delay).await;
+        // Our map entry served its purpose (cancellation during the wait) —
+        // drop it now so every exit below leaves the map clean. A user
+        // dispatch that lands from here on is caught by the live-turn check.
+        lock(&inner2.rate_limit_resumes).remove(&chat);
+        // User sent during the wait → the pending resume was cancelled
+        // (dispatch_inner aborts it); a live turn is the belt-and-braces
+        // check for the same thing.
+        let engine = SessionsEngine {
+            inner: inner2.clone(),
+        };
+        if engine.turn_in_flight(&chat) {
+            return;
+        }
+        // Re-dispatch the LAST user prompt under its own id (dedupe).
+        let last_user = doc.read_entries().ok().and_then(|entries| {
+            entries
+                .iter()
+                .rev()
+                .find(|e| e.role == MessageRole::User)
+                .and_then(|e| {
+                    e.parts.iter().find_map(|p| match p {
+                        MessagePart::Text { text, .. } => Some((e.id.clone(), text.clone())),
+                        _ => None,
+                    })
+                })
+        });
+        let Some((user_id, prompt)) = last_user else {
+            tracing::warn!(chat = %chat, "rate-limit resume lost: no user turn to re-dispatch");
+            return;
+        };
+        let Some(host) = inner2.doc_host() else {
+            tracing::warn!(chat = %chat, "rate-limit resume lost: doc host unavailable");
+            return;
+        };
+        let Some(mut request) = engine
+            .last_request(&chat)
+            .or_else(|| host.request_from_chat_row(&chat, &prompt))
+        else {
+            tracing::warn!(chat = %chat, "rate-limit resume lost: no run config to re-dispatch");
+            return;
+        };
+        request.prompt = prompt;
+        // The engine injects the stored harness session id; attachments were
+        // consumed by the original turn and are not re-inlined.
+        request.resume = None;
+        request.attachments = Vec::new();
+        let harness = host.harness_for_request(&chat, &request);
+        tracing::info!(chat = %chat, "rate-limit auto-resume re-dispatching");
+        if let Err(err) = host
+            .dispatch_with_source_context(&engine, &chat, harness, request, Some(user_id))
+            .await
+        {
+            tracing::warn!(chat = %chat, error = %err, "rate-limit auto-resume dispatch failed");
+            engine
+                .inner
+                .set_status(&chat, SessionStatus::Errored, false);
+        }
+    });
+    lock(&inner.rate_limit_resumes).insert(chat_id.to_string(), RateLimitResume { task });
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn devin_rate_limit_classifier() {
+        for detail in [
+            "rate limit reached",
+            "RATE_LIMIT_EXCEEDED",
+            "{\"code\":429,\"message\":\"Too Many Requests\"}",
+            "HTTP 429",
+            "daily ACU quota exhausted",
+            "usage limit reached for your plan",
+            "insufficient credits",
+            "token quota exceeded",
+        ] {
+            assert!(
+                super::is_devin_rate_limit(detail),
+                "should classify: {detail}"
+            );
+        }
+        for detail in [
+            "model returned invalid output",
+            "connection reset by peer",
+            "tool call timed out",
+            "session not found",
+        ] {
+            assert!(
+                !super::is_devin_rate_limit(detail),
+                "should NOT classify: {detail}"
+            );
+        }
+    }
+
     #[test]
     fn cursor_recovery_converts_rich_messages_before_json_encoding() {
         let doc = zeron_doc::SessionDoc::init("cursor-rich-recovery").unwrap();

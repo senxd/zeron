@@ -24,10 +24,13 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
+use zeron_doc::{
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry,
+};
 use zeron_proto::{
-    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
-    UserInputQuestion, capabilities,
+    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, ScheduledChatCreate,
+    ScheduledPromptDraft, ScheduledPromptStatus, SlashCommand, UserInputAnswer, UserInputQuestion,
+    capabilities,
 };
 use zeron_rpc::{RpcError, methods};
 
@@ -499,6 +502,10 @@ pub enum SendButtonMode {
     Queue,
     /// Live run, nothing typed: red stop square.
     Stop,
+    /// "resme" (personal feature): no live run, empty composer, and the last
+    /// turn was cut short — the button becomes a resume icon that
+    /// re-dispatches the last user turn into the stored harness session.
+    Resume,
 }
 
 /// What the composer holds that a send could carry. A staged image, diff
@@ -578,6 +585,138 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
         (false, _) => SendButtonMode::Send,
         (true, true) => SendButtonMode::Queue,
         (true, false) => SendButtonMode::Stop,
+    }
+}
+
+/// The chat's most recent user turn as `(entry id, text)` — what a resume
+/// re-dispatches. Mirrors the engine's last-user-entry scan: only real text
+/// counts (an attachment-only row has no prompt to re-run).
+fn last_user_turn(transcript: &[SessionMessageEntry]) -> Option<(String, String)> {
+    transcript
+        .iter()
+        .rev()
+        .find(|e| e.role == MessageRole::User)
+        .and_then(|e| {
+            e.parts.iter().find_map(|p| match p {
+                MessagePart::Text { text, .. } if !text.trim().is_empty() => {
+                    Some((e.id.clone(), text.clone()))
+                }
+                _ => None,
+            })
+        })
+}
+
+/// Relative-pick list for the schedule popover — labels plus the resolved UTC
+/// instant. Tomorrow picks are wall-clock local (DST-safe via chrono).
+fn schedule_quick_picks(
+    now: chrono::DateTime<chrono::Local>,
+) -> Vec<(SharedString, chrono::DateTime<chrono::Utc>)> {
+    let mut picks = Vec::new();
+    for (label, minutes) in [
+        ("In 15 minutes", 15i64),
+        ("In 1 hour", 60),
+        ("In 4 hours", 240),
+    ] {
+        picks.push((
+            label.into(),
+            (now + chrono::Duration::minutes(minutes)).with_timezone(&chrono::Utc),
+        ));
+    }
+    for (label, hour) in [("Tomorrow 9:00 AM", 9u32), ("Tomorrow 6:00 PM", 18)] {
+        let naive = (now.date_naive() + chrono::Days::new(1))
+            .and_hms_opt(hour, 0, 0)
+            .expect("valid clock time");
+        if let Some(local) = naive.and_local_timezone(chrono::Local).single() {
+            picks.push((label.into(), local.with_timezone(&chrono::Utc)));
+        }
+    }
+    picks
+}
+
+/// Lenient local-time parser for the schedule field (personal feature).
+/// Accepts `"HH:MM"`/`"H:MM"` (24h), `"9pm"`/`"9:30 am"` (12h), `"MM/DD HH:MM"`
+/// (this year), and `"YYYY-MM-DD[ T]HH:MM[:SS]"`. Time-only means today, or
+/// tomorrow once that time has passed. `None` = unparseable or already past.
+fn parse_schedule_time(
+    text: &str,
+    now: chrono::DateTime<chrono::Local>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{DateTime, Days, Local, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let to_utc = |naive: NaiveDateTime| -> Option<DateTime<Utc>> {
+        naive
+            .and_local_timezone(Local)
+            .latest()
+            .map(|t| t.with_timezone(&Utc))
+    };
+    let now_utc = now.with_timezone(&Utc);
+    // Explicit date+time forms first.
+    for fmt in [
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(text, fmt) {
+            return to_utc(naive).filter(|t| *t > now_utc);
+        }
+    }
+    // "MM/DD HH:MM" — this year.
+    if let Ok(naive) =
+        NaiveDateTime::parse_from_str(&format!("{}-{text}", now.format("%Y")), "%Y-%m/%d %H:%M")
+    {
+        return to_utc(naive).filter(|t| *t > now_utc);
+    }
+    // Time-only: 24h clock, or 12h with an am/pm suffix.
+    let lower = text.to_lowercase();
+    let (clock, pm) = if let Some(c) = lower.strip_suffix("am") {
+        (c.trim(), Some(false))
+    } else if let Some(c) = lower.strip_suffix("pm") {
+        (c.trim(), Some(true))
+    } else {
+        (lower.trim(), None)
+    };
+    // chrono's %H demands two digits — normalize a bare hour to "H:00" first.
+    let normalized = if clock.contains(':') {
+        clock.to_string()
+    } else {
+        format!("{clock}:00")
+    };
+    let mut time = NaiveTime::parse_from_str(&normalized, "%H:%M:%S")
+        .or_else(|_| NaiveTime::parse_from_str(&normalized, "%H:%M"))
+        .ok()?;
+    if let Some(pm) = pm {
+        let hour = time.hour();
+        if hour == 0 || hour > 12 {
+            return None; // "0pm"/"13pm" is nonsense
+        }
+        let h24 = match (pm, hour) {
+            (true, 12) => 12,
+            (true, h) => h + 12,
+            (false, 12) => 0,
+            (false, h) => h,
+        };
+        time = NaiveTime::from_hms_opt(h24, time.minute(), time.second())?;
+    }
+    let mut date = now.date_naive();
+    if date.and_time(time) <= now.naive_local() {
+        date = date.checked_add_days(Days::new(1)).unwrap_or(date);
+    }
+    to_utc(date.and_time(time))
+}
+
+/// The popover's local-time readout — today shows only the clock, other days
+/// get a short date.
+fn format_schedule_local(at: chrono::DateTime<chrono::Utc>) -> String {
+    let local = at.with_timezone(&chrono::Local);
+    let today = chrono::Local::now().date_naive();
+    if local.date_naive() == today {
+        local.format("%-I:%M %p").to_string()
+    } else {
+        local.format("%a %-m/%-d, %-I:%M %p").to_string()
     }
 }
 
@@ -5383,11 +5522,17 @@ pub struct Composer {
     /// Set on every session/route change: flips committed before this instant
     /// SNAP instead of morphing (see [`ROUTE_SNAP_MS`]).
     route_snap_until: Option<Instant>,
+    /// Scheduled-prompt popover (personal feature): clock-button overlay —
+    /// quick picks, a custom-time field, and the engine's upcoming rows.
+    schedule_open: bool,
+    schedule_input: Entity<ComposerInput>,
+    schedule_scroll: gpui::ScrollHandle,
     _observe: Subscription,
     _pickers_observe: Subscription,
     _picker_focus: Subscription,
     _picker_settings: Subscription,
     _input_events: Subscription,
+    _schedule_input_events: Subscription,
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -5477,6 +5622,16 @@ impl Composer {
                 cx.emit(ComposerEvent::OpenLoadoutSettings);
             },
         );
+        let schedule_input = cx.new(|cx| {
+            ComposerInput::with_context("18:30, 9pm, or 2026-09-24 09:00", "SchedulePromptTime", cx)
+                .with_single_line()
+        });
+        let schedule_input_events =
+            cx.subscribe(&schedule_input, |this: &mut Self, _, event, cx| {
+                if matches!(event, ComposerInputEvent::Submitted) {
+                    this.schedule_submit_custom(cx);
+                }
+            });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
@@ -5600,11 +5755,15 @@ impl Composer {
             height_morph: None,
             morph_clock: Instant::now(),
             route_snap_until: None,
+            schedule_open: false,
+            schedule_input,
+            schedule_scroll: gpui::ScrollHandle::new(),
             _observe: observe,
             _pickers_observe: pickers_observe,
             _picker_focus: picker_focus,
             _picker_settings: picker_settings,
             _input_events: input_events,
+            _schedule_input_events: schedule_input_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
         // a rig) — `ZERON_ATTACH=/path/a.png[,/path/b.png]`, and
@@ -6815,6 +6974,219 @@ impl Composer {
         ))
     }
 
+    /// Scheduled prompts (personal feature): quick picks, a custom-time
+    /// field, and the engine's upcoming/finished rows with cancel + run-now.
+    fn render_schedule_popover(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.schedule_open {
+            return None;
+        }
+        let theme = &theme.for_popup();
+        let now = chrono::Local::now();
+        let has_prompt = !self.input.read(cx).text().trim().is_empty();
+        let mut card = crate::popover::completion_card(theme).on_mouse_down_out(cx.listener(
+            |this, _, _, cx| {
+                this.schedule_open = false;
+                cx.notify();
+            },
+        ));
+        card = card.child(
+            div()
+                .px(px(10.0))
+                .pt(px(9.0))
+                .pb(px(4.0))
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_muted)
+                .child(if has_prompt {
+                    "Send this prompt later"
+                } else {
+                    "Write a prompt, then pick a time"
+                }),
+        );
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+        for (label, at) in schedule_quick_picks(now) {
+            let detail: SharedString = format_schedule_local(at).into();
+            rows.push(
+                crate::popover::menu_row(theme, false, format!("schedule-pick-{label}"))
+                    .id(SharedString::from(format!("schedule-pick-{label}")))
+                    .on_click(cx.listener(move |this, _, _, cx| this.schedule_send(at, cx)))
+                    .child(crate::popover::completion_row_content(
+                        theme,
+                        crate::icons::icon(crate::icons::CLOCK_CIRCLE)
+                            .size(px(16.0))
+                            .text_color(theme.text_muted)
+                            .into_any_element(),
+                        label,
+                        detail,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        card = card.child(
+            crate::popover::menu_scroll_host("schedule-picks-host").child(
+                crate::popover::completion_list("schedule-picks", &self.schedule_scroll, rows),
+            ),
+        );
+        // Custom time: free-form local time, Enter or the button submits.
+        card = card.child(
+            div()
+                .px(px(10.0))
+                .pb(px(6.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(div().flex_1().min_w_0().child(self.schedule_input.clone()))
+                .child(
+                    div()
+                        .id("schedule-custom-submit")
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .rounded(px(6.0))
+                        .bg(theme.text)
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.bg)
+                        .cursor_pointer()
+                        .hover(|s| s.opacity(0.85))
+                        .on_click(cx.listener(|this, _, _, cx| this.schedule_submit_custom(cx)))
+                        .child("Schedule"),
+                ),
+        );
+        let prompts = self.state.read(cx).scheduled_prompts.clone();
+        if !prompts.is_empty() {
+            card = card.child(div().h(px(1.0)).mx(px(8.0)).mb(px(4.0)).bg(theme.border));
+            let mut rows: Vec<gpui::AnyElement> = Vec::new();
+            for item in prompts.iter().take(12) {
+                let pending = item.status == ScheduledPromptStatus::Pending;
+                let failed = item.status == ScheduledPromptStatus::Failed;
+                let prompt_preview: String = item
+                    .request
+                    .prompt
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(48)
+                    .collect();
+                let when = match item.status {
+                    ScheduledPromptStatus::Pending => format_schedule_local(item.run_at),
+                    ScheduledPromptStatus::Fired => item
+                        .fired_at
+                        .map(|t| format!("Sent {}", format_schedule_local(t)))
+                        .unwrap_or_else(|| "Sent".to_string()),
+                    ScheduledPromptStatus::Failed => format!(
+                        "Failed{}",
+                        item.error
+                            .as_deref()
+                            .map(|e| format!(" — {e}"))
+                            .unwrap_or_default()
+                    ),
+                };
+                let delete_id = item.id.clone();
+                let run_id = item.id.clone();
+                rows.push(
+                    div()
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            crate::icons::icon(if pending {
+                                crate::icons::CLOCK_CIRCLE
+                            } else if failed {
+                                crate::icons::CLOSE_CIRCLE
+                            } else {
+                                crate::icons::CHECK
+                            })
+                            .size(px(14.0))
+                            .text_color(if failed {
+                                theme.danger_muted
+                            } else {
+                                theme.text_muted
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(crate::typography::ui_rems(12.0))
+                                        .text_color(theme.text)
+                                        .child(prompt_preview),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(crate::typography::ui_rems(10.5))
+                                        .text_color(if failed {
+                                            theme.danger_muted
+                                        } else {
+                                            theme.text_muted
+                                        })
+                                        .child(when),
+                                ),
+                        )
+                        .when(pending, |row| {
+                            row.child(
+                                div()
+                                    .id(SharedString::from(format!("schedule-run-now-{run_id}")))
+                                    .size(px(20.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(crate::theme::ink(0.10)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.schedule_run_now(run_id.clone(), cx)
+                                    }))
+                                    .child(
+                                        crate::icons::icon(crate::icons::ACTION_PLAY)
+                                            .size(px(12.0))
+                                            .text_color(theme.text_muted),
+                                    ),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("schedule-delete-{delete_id}")))
+                                .size(px(20.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(crate::theme::ink(0.10)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.schedule_delete(delete_id.clone(), cx)
+                                }))
+                                .child(
+                                    crate::icons::icon(crate::icons::CLOSE)
+                                        .size(px(12.0))
+                                        .text_color(theme.text_muted),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+            }
+            card = card.child(
+                crate::popover::menu_scroll_host("schedule-list-host").child(
+                    crate::popover::completion_list("schedule-list", &self.schedule_scroll, rows),
+                ),
+            );
+        }
+        Some(crate::popover::full_width_menu_above(
+            "schedule-popover",
+            card.into_any_element(),
+            None,
+        ))
+    }
+
     fn render_input_with_completion(&self) -> gpui::Div {
         div().relative().child(self.input.clone())
     }
@@ -7480,7 +7852,112 @@ impl Composer {
             self.staged().len() + self.staged_appshots().len(),
             self.extra_count(cx),
         );
-        send_button_mode(self.run_live(cx), has_text)
+        let run_live = self.run_live(cx);
+        if !run_live && !has_text && self.resumable(cx) {
+            return SendButtonMode::Resume;
+        }
+        send_button_mode(run_live, has_text)
+    }
+
+    /// "resme": the chat can be resumed from the composer's empty-submit.
+    /// True when the last turn ended short of completion — a user/crash
+    /// interrupt (aborted assistant entry) or a dead run (errored session) —
+    /// and there is both a stored harness session to continue and a user
+    /// turn to re-dispatch under its own id.
+    fn resumable(&self, cx: &App) -> bool {
+        let s = self.state.read(cx);
+        let Some(chat_id) = s.selected_chat.as_deref() else {
+            return false;
+        };
+        let cut_short = matches!(
+            s.indicator_for(chat_id, chrono::Utc::now()),
+            Indicator::Errored
+        ) || s
+            .transcript
+            .iter()
+            .rev()
+            .find(|e| e.role == MessageRole::Assistant)
+            .is_some_and(|e| e.status == Some(MessageStatus::Aborted));
+        if !cut_short {
+            return false;
+        }
+        // Without a harness-native session id a re-dispatch is a bare retry
+        // (fresh session, prompt only) — that is not what the icon promises.
+        // An empty-string id is the explicit "do not resume" tombstone.
+        let has_session = s
+            .selected_chat_row()
+            .and_then(|c| c.harness_session_id.as_deref())
+            .is_some_and(|id| !id.is_empty());
+        has_session && last_user_turn(&s.transcript).is_some()
+    }
+
+    /// Queue a `Run` for the last user turn under its own message id — the
+    /// doc dedupes the user row, and the host injects the stored harness
+    /// session id, so the stopped task continues where it left off.
+    fn resume(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let (chat_id, request, message_id) = {
+            let s = self.state.read(cx);
+            let Some(chat_id) = s.selected_chat.clone() else {
+                return;
+            };
+            let Some((message_id, prompt)) = last_user_turn(&s.transcript) else {
+                return;
+            };
+            let chat = s.selected_chat_row();
+            let config = chat.and_then(|c| c.config.clone());
+            let request = RunRequest {
+                prompt,
+                harness: config.as_ref().map(|c| c.harness),
+                model: config.as_ref().and_then(|c| c.model.clone()),
+                reasoning: config.as_ref().and_then(|c| c.reasoning),
+                model_options: config
+                    .as_ref()
+                    .map(|c| c.model_options.clone())
+                    .unwrap_or_default(),
+                cwd: chat.and_then(|c| c.cwd.clone()).unwrap_or_default(),
+                sandbox: config
+                    .as_ref()
+                    .map(|c| c.sandbox)
+                    .unwrap_or(SandboxLevel::WorkspaceWrite),
+                auto_approve: false,
+                // The host re-injects the chat's stored harness session id;
+                // a UI-set value would fight `resume_for`'s cwd checks.
+                resume: None,
+                attachments: Vec::new(),
+                worktree: None,
+            };
+            (chat_id, request, message_id)
+        };
+        let command = SessionCommandPayload::Run {
+            request,
+            message_id,
+        };
+        let command = match serde_json::to_value(&command) {
+            Ok(command) => command,
+            Err(err) => {
+                self.failure = Some(format!("Resume failed: {err}").into());
+                self.failure_key = Some(chat_id);
+                cx.notify();
+                return;
+            }
+        };
+        let params = serde_json::json!({ "chatId": chat_id, "command": command });
+        let failure_chat = chat_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            if let Err(err) = result {
+                this.update(cx, |composer, cx| {
+                    composer.failure = Some(format!("Resume failed: {err}").into());
+                    composer.failure_key = Some(failure_chat);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn execute_workspace_command(
@@ -7536,6 +8013,8 @@ impl Composer {
             // (issue #406). Stop stays on the button — and on Esc when
             // escape_stops_active_agent is enabled.
             SendButtonMode::Stop => {}
+            // Resume needs no draft: it re-dispatches the last user turn.
+            SendButtonMode::Resume => self.resume(cx),
             _ if no_content => {}
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Send => self.send(text, false, cx),
@@ -8384,6 +8863,244 @@ impl Composer {
         self.interrupting.contains(chat_id)
     }
 
+    // ---- scheduled prompts (personal feature) ----
+
+    /// The clock button only makes sense against an engine that owns a
+    /// scheduler — hide it on older IPC daemons.
+    fn scheduling_supported(&self, cx: &App) -> bool {
+        self.state.read(cx).engine().is_some_and(|engine| {
+            engine
+                .engine_info()
+                .supports(capabilities::SCHEDULED_PROMPTS_V1)
+        })
+    }
+
+    fn toggle_schedule_popover(&mut self, cx: &mut Context<Self>) {
+        self.schedule_open = !self.schedule_open;
+        cx.notify();
+    }
+
+    /// The `SchedulePrompt` draft for the composer's current target — an
+    /// existing chat rides its row's config; the blank canvas mints a
+    /// `ScheduledChatCreate` from the picked project/device/checkout, exactly
+    /// like `send`'s `Mutate createChat`.
+    fn schedule_draft(
+        &self,
+        prompt: String,
+        run_at: chrono::DateTime<chrono::Utc>,
+        cx: &App,
+    ) -> ScheduledPromptDraft {
+        let resolved = self.pickers.read(cx).resolved(cx);
+        let state = self.state.read(cx);
+        if let Some(chat_id) = state.selected_chat.clone() {
+            let chat = state.selected_chat_row();
+            let config = chat.and_then(|c| c.config.clone());
+            return ScheduledPromptDraft {
+                chat_id: Some(chat_id),
+                create: None,
+                request: RunRequest {
+                    prompt,
+                    harness: resolved
+                        .harness
+                        .or_else(|| config.as_ref().map(|c| c.harness)),
+                    model: resolved
+                        .model
+                        .clone()
+                        .or_else(|| config.as_ref().and_then(|c| c.model.clone())),
+                    reasoning: resolved
+                        .reasoning
+                        .or_else(|| config.as_ref().and_then(|c| c.reasoning)),
+                    model_options: resolved.model_options.clone(),
+                    cwd: chat.and_then(|c| c.cwd.clone()).unwrap_or_default(),
+                    sandbox: config
+                        .as_ref()
+                        .map(|c| c.sandbox)
+                        .unwrap_or(SandboxLevel::WorkspaceWrite),
+                    auto_approve: false,
+                    resume: None,
+                    attachments: Vec::new(),
+                    worktree: None,
+                },
+                run_at,
+            };
+        }
+        // New-chat canvas — mirror `send`'s checkout-plan resolution.
+        let plan = self.pickers.read(cx).checkout_plan();
+        let space = state.selected_space_row().cloned();
+        let space_id = space.as_ref().map(|s| s.id.clone());
+        let space_path = space.as_ref().map(|s| s.path.clone());
+        let device_id = state
+            .effective_device_id()
+            .or_else(|| state.local_device_id.clone())
+            .unwrap_or_else(|| "local".to_string());
+        let mut cwd = space_path.clone().unwrap_or_else(|| "~".to_string());
+        let mut worktree_cwd = None;
+        let mut chat_branch = None;
+        let mut run_worktree = None;
+        if space_path.is_some() {
+            match &plan {
+                crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
+                    chat_branch = branch.clone();
+                }
+                crate::pickers::CheckoutPlan::ReuseWorktree { path, branch } => {
+                    cwd = path.clone();
+                    worktree_cwd = Some(path.clone());
+                    chat_branch = Some(branch.clone());
+                }
+                crate::pickers::CheckoutPlan::NewWorktree { base } => {
+                    chat_branch = base.clone();
+                    if let Some(repo_path) = &space_path {
+                        run_worktree = Some(zeron_proto::WorktreeSpec {
+                            repo_path: repo_path.clone(),
+                            base: base.clone().unwrap_or_else(|| "HEAD".to_string()),
+                            space_id: space_id.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        ScheduledPromptDraft {
+            chat_id: None,
+            create: Some(ScheduledChatCreate {
+                space_id: space_id.clone(),
+                device_id: space_id.is_none().then_some(device_id),
+                // The host resolves the space's own folder; only an explicit
+                // worktree target overrides it.
+                cwd: worktree_cwd,
+                branch: chat_branch,
+                config: resolved.chat_config(),
+            }),
+            request: RunRequest {
+                prompt,
+                harness: resolved.harness,
+                model: resolved.model.clone(),
+                reasoning: resolved.reasoning,
+                model_options: resolved.model_options.clone(),
+                cwd,
+                sandbox: SandboxLevel::WorkspaceWrite,
+                auto_approve: false,
+                resume: None,
+                attachments: Vec::new(),
+                worktree: run_worktree,
+            },
+            run_at,
+        }
+    }
+
+    /// Schedule the composer's text for `run_at`. The draft is consumed the
+    /// moment the RPC is accepted; a failed schedule hands the text back.
+    fn schedule_send(&mut self, run_at: chrono::DateTime<chrono::Utc>, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            self.failure_key = None;
+            cx.notify();
+            return;
+        };
+        let prompt = self.input.read(cx).text().trim().to_string();
+        if prompt.is_empty() {
+            self.failure = Some("Write a prompt to schedule.".into());
+            self.failure_key = Some(self.current_key.clone());
+            cx.notify();
+            return;
+        }
+        let draft = self.schedule_draft(prompt.clone(), run_at, cx);
+        let params = match serde_json::to_value(&draft) {
+            Ok(params) => params,
+            Err(err) => {
+                self.failure = Some(format!("Schedule failed: {err}").into());
+                self.failure_key = Some(self.current_key.clone());
+                cx.notify();
+                return;
+            }
+        };
+        self.schedule_open = false;
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.drafts.insert(self.current_key.clone(), String::new());
+        cx.notify();
+        let failure_key = self.current_key.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::SCHEDULE_PROMPT, params).await;
+            if let Err(err) = result {
+                this.update(cx, |composer, cx| {
+                    composer.failure = Some(format!("Schedule failed: {err}").into());
+                    composer.failure_key = Some(failure_key);
+                    // A failed schedule must never eat the draft.
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_text(prompt, cx));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn schedule_submit_custom(&mut self, cx: &mut Context<Self>) {
+        let text = self.schedule_input.read(cx).text().to_string();
+        match parse_schedule_time(&text, chrono::Local::now()) {
+            Some(run_at) => {
+                self.schedule_input
+                    .update(cx, |input, cx| input.set_text("", cx));
+                self.schedule_send(run_at, cx);
+            }
+            None => {
+                self.failure = Some(
+                    "Couldn't parse that time — try \"18:30\", \"9pm\", or \"2026-09-24 09:00\"."
+                        .into(),
+                );
+                self.failure_key = Some(self.current_key.clone());
+                cx.notify();
+            }
+        }
+    }
+
+    fn schedule_delete(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = serde_json::json!({ "id": id });
+        let failure_key = self.current_key.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::DELETE_SCHEDULED_PROMPT, params)
+                .await;
+            if let Err(err) = result {
+                this.update(cx, |composer, cx| {
+                    composer.failure = Some(format!("Delete failed: {err}").into());
+                    composer.failure_key = Some(failure_key);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn schedule_run_now(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = serde_json::json!({ "id": id });
+        let failure_key = self.current_key.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::RUN_SCHEDULED_PROMPT_NOW, params)
+                .await;
+            if let Err(err) = result {
+                this.update(cx, |composer, cx| {
+                    composer.failure = Some(format!("Run now failed: {err}").into());
+                    composer.failure_key = Some(failure_key);
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     // ---- wizard glue ----
 
     fn wizard_select(&mut self, option_ix: usize, cx: &mut Context<Self>) {
@@ -8769,6 +9486,24 @@ impl Composer {
                 .hover(|s| s.opacity(0.85))
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt_selected(cx)))
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
+                .into_any_element(),
+            SendButtonMode::Resume => div()
+                .id("composer-resume")
+                .size(px(28.0))
+                .flex_none()
+                .rounded_full()
+                .bg(theme.text)
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.85))
+                .on_click(cx.listener(|this, _, _, cx| this.resume(cx)))
+                .child(
+                    crate::icons::icon(crate::icons::RESTART)
+                        .size(px(14.0))
+                        .text_color(theme.bg),
+                )
                 .into_any_element(),
             SendButtonMode::Send | SendButtonMode::Queue => {
                 // Share the submission guard with Enter, including pending
@@ -9286,6 +10021,31 @@ impl Render for Composer {
         });
 
         let send_button = self.render_send_button(mode, cx);
+        // Schedule button (personal feature): opens the quick-pick/custom-time
+        // popover. Absent on engines that predate the scheduler.
+        let schedule_button = self.scheduling_supported(cx).then(|| {
+            div()
+                .id("composer-schedule")
+                .size(px(28.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .cursor_pointer()
+                .bg(motion::hover_blend(
+                    "composer-schedule",
+                    gpui::transparent_black(),
+                    crate::theme::ink(0.10),
+                ))
+                .on_hover(motion::hover_listener("composer-schedule"))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_schedule_popover(cx)))
+                .child(
+                    crate::icons::icon(crate::icons::CLOCK_CIRCLE)
+                        .size(px(15.0))
+                        .text_color(theme.text_muted),
+                )
+        });
         // Attach button — opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. The leading utility group owns the spacing between
@@ -9473,6 +10233,7 @@ impl Render for Composer {
                                 .items_center()
                                 .gap(px(ACTION_UTILITY_GAP))
                                 .child(attach)
+                                .children(schedule_button)
                                 .child(model_picker),
                         )
                         .child(send_button),
@@ -9513,7 +10274,11 @@ impl Render for Composer {
                                 .pl(px(action_inset))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(attach),
+                                .flex()
+                                .items_center()
+                                .gap(px(ACTION_UTILITY_GAP))
+                                .child(attach)
+                                .children(schedule_button),
                         )
                         .child(
                             div()
@@ -9585,7 +10350,8 @@ impl Render for Composer {
             // Both completion popups span the full pill width above it —
             // the file-mention and slash tokens are mutually exclusive.
             .children(self.render_file_mention_popup(&theme, cx))
-            .children(self.render_slash_popup(&theme, cx));
+            .children(self.render_slash_popup(&theme, cx))
+            .children(self.render_schedule_popover(&theme, cx));
         // Restore the original chip-only selector treatment: destination at
         // the top-right, no surrounding surface. Cancel the column gap as the
         // row collapses so the pill never jumps at the route boundary.
@@ -13407,6 +14173,85 @@ mod tests {
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Queue);
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
+    }
+
+    #[test]
+    fn schedule_time_parser() {
+        use chrono::{Days, Local, NaiveDate, TimeZone};
+        let now = Local.with_ymd_and_hms(2026, 9, 22, 10, 0, 0).unwrap();
+        let date_of = |t: chrono::DateTime<chrono::Utc>| t.with_timezone(&Local).date_naive();
+        let clock_of =
+            |t: chrono::DateTime<chrono::Utc>| t.with_timezone(&Local).format("%H:%M").to_string();
+        // 24h time-only: later today stays today, already-past rolls to tomorrow.
+        let t = parse_schedule_time("18:30", now).unwrap();
+        assert_eq!(clock_of(t), "18:30");
+        assert_eq!(date_of(t), now.date_naive());
+        let t = parse_schedule_time("08:30", now).unwrap();
+        assert_eq!(date_of(t), now.date_naive() + Days::new(1));
+        // 12h forms.
+        let t = parse_schedule_time("9pm", now).unwrap();
+        assert_eq!(clock_of(t), "21:00");
+        let t = parse_schedule_time("9:30 am", now).unwrap();
+        assert_eq!(date_of(t), now.date_naive() + Days::new(1));
+        let t = parse_schedule_time("12:15pm", now).unwrap();
+        assert_eq!(clock_of(t), "12:15");
+        assert_eq!(date_of(t), now.date_naive());
+        // Explicit dates.
+        let t = parse_schedule_time("2026-09-23 09:00", now).unwrap();
+        assert_eq!(date_of(t), NaiveDate::from_ymd_opt(2026, 9, 23).unwrap());
+        let t = parse_schedule_time("9/23 09:00", now).unwrap();
+        assert_eq!(date_of(t), NaiveDate::from_ymd_opt(2026, 9, 23).unwrap());
+        // Past / unparseable → None.
+        assert!(parse_schedule_time("2020-01-01 09:00", now).is_none());
+        assert!(parse_schedule_time("9/21 09:00", now).is_none());
+        assert!(parse_schedule_time("soonish", now).is_none());
+        assert!(parse_schedule_time("25:99", now).is_none());
+        assert!(parse_schedule_time("13pm", now).is_none());
+    }
+
+    #[test]
+    fn last_user_turn_picks_latest_text_entry() {
+        let entry = |id: &str, role: MessageRole, text: &str| SessionMessageEntry {
+            id: id.into(),
+            role,
+            parts: vec![MessagePart::Text {
+                id: format!("{id}-p"),
+                text: text.into(),
+            }],
+            created_at: 0,
+            device_id: "d".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        };
+        let transcript = vec![
+            entry("u1", MessageRole::User, "first"),
+            entry("a1", MessageRole::Assistant, "reply"),
+            entry("u2", MessageRole::User, "second"),
+            entry("a2", MessageRole::Assistant, "reply2"),
+        ];
+        assert_eq!(
+            last_user_turn(&transcript),
+            Some(("u2".to_string(), "second".to_string()))
+        );
+        assert!(last_user_turn(&[]).is_none());
+        // A user row with only an image part has no prompt to re-dispatch.
+        let image_only = vec![SessionMessageEntry {
+            id: "u1".into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Image {
+                id: "p".into(),
+                path: "/tmp/x.png".into(),
+                name: "x.png".into(),
+                mime_type: "image/png".into(),
+            }],
+            created_at: 0,
+            device_id: "d".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        }];
+        assert!(last_user_turn(&image_only).is_none());
     }
 
     #[test]
