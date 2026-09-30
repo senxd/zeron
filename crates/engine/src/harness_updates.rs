@@ -905,7 +905,7 @@ impl HarnessUpdateCoordinator {
         let args: &[&str] = if package.cask {
             &["info", "--cask", "--json=v2", token]
         } else {
-            &["info", "--json=v2", token]
+            &["info", "--formula", "--json=v2", token]
         };
         // Don't refresh taps on a probe. `brew upgrade` does that when applying.
         let output = run_command_output_env(&brew, args, COMMAND_TIMEOUT, BREW_INFO_ENV).await?;
@@ -1925,6 +1925,9 @@ fn homebrew_token_ok(token: &str) -> bool {
         && token
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '_' | '.' | '@'))
+        // brew loads a `.rb` or `.json` argument as a local package file.
+        && !token.ends_with(".rb")
+        && !token.ends_with(".json")
 }
 
 fn homebrew_url_component(token: &str) -> String {
@@ -1946,6 +1949,10 @@ fn homebrew_url_component(token: &str) -> String {
 /// that a keg-only runtime such as `node@20` keeps inside its own keg, belong
 /// to that package manager, and upgrading the runtime would not update them.
 fn homebrew_package(path: &Path) -> Option<HomebrewPackage> {
+    // Homebrew runs only on macOS and Linux.
+    if !cfg!(unix) {
+        return None;
+    }
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let components: Vec<_> = canonical.components().collect();
     let (index, cask) =
@@ -1986,9 +1993,8 @@ fn homebrew_package(path: &Path) -> Option<HomebrewPackage> {
     if prefix.as_os_str().is_empty() {
         return None;
     }
-    let brew_name = if cfg!(windows) { "brew.exe" } else { "brew" };
     Some(HomebrewPackage {
-        brew: prefix.join("bin").join(brew_name),
+        brew: prefix.join("bin").join("brew"),
         cask,
         token: token.to_string(),
     })
@@ -3471,12 +3477,15 @@ esac
             ),
         ] {
             let path = std::path::Path::new(path);
-            assert!(super::can_apply_update(HarnessId::ClaudeCode, path));
-            assert_eq!(
-                super::claude_package_manager_command(path).as_deref(),
-                Some(command)
-            );
             assert_eq!(super::claude_cask_channel(path).unwrap(), channel);
+            // Homebrew runs only on macOS and Linux.
+            if cfg!(unix) {
+                assert!(super::can_apply_update(HarnessId::ClaudeCode, path));
+                assert_eq!(
+                    super::claude_package_manager_command(path).as_deref(),
+                    Some(command)
+                );
+            }
         }
         assert!(!super::can_apply_update(
             HarnessId::ClaudeCode,
@@ -3538,6 +3547,7 @@ esac
         coordinator.shutdown().await;
     }
 
+    #[cfg(unix)]
     #[test]
     fn homebrew_layout_selects_cask_or_formula_upgrade() {
         let codex = super::homebrew_package(std::path::Path::new(
@@ -3631,6 +3641,17 @@ esac
             ))
             .is_none()
         );
+        // brew would load these as local package files.
+        for token in ["codex.rb", "codex.json"] {
+            assert!(
+                super::homebrew_package(
+                    &std::path::Path::new("/opt/homebrew/Cellar")
+                        .join(token)
+                        .join("1.0.0/bin/codex")
+                )
+                .is_none()
+            );
+        }
         assert!(
             !super::can_apply_update(
                 HarnessId::Codex,
