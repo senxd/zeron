@@ -1940,9 +1940,11 @@ fn homebrew_url_component(token: &str) -> String {
     encoded
 }
 
-/// `Caskroom/<token>` and `Cellar/<token>` are Homebrew's own layout. Anything
-/// else under a Homebrew prefix, including npm packages in `lib/node_modules`,
-/// is not a Homebrew-owned CLI.
+/// `Caskroom/<token>/<version>/…` and `Cellar/<token>/<version>/{bin,libexec}/…`
+/// are Homebrew's own layout. Anything else under a Homebrew prefix is not a
+/// Homebrew-owned CLI: npm packages in `lib/node_modules`, including globals
+/// that a keg-only runtime such as `node@20` keeps inside its own keg, belong
+/// to that package manager, and upgrading the runtime would not update them.
 fn homebrew_package(path: &Path) -> Option<HomebrewPackage> {
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let components: Vec<_> = canonical.components().collect();
@@ -1957,6 +1959,24 @@ fn homebrew_package(path: &Path) -> Option<HomebrewPackage> {
             })?;
     let token = components.get(index + 1)?.as_os_str().to_str()?;
     if !homebrew_token_ok(token) {
+        return None;
+    }
+    let is_normal = |offset: usize| {
+        matches!(
+            components.get(index + offset),
+            Some(std::path::Component::Normal(_))
+        )
+    };
+    // The executable must live inside a versioned install of the package.
+    if !is_normal(2) || !is_normal(3) {
+        return None;
+    }
+    if !cask
+        && !matches!(
+            components[index + 3].as_os_str().to_str(),
+            Some("bin" | "libexec")
+        )
+    {
         return None;
     }
     let mut prefix = PathBuf::new();
@@ -3571,6 +3591,43 @@ esac
         assert!(
             super::homebrew_package(std::path::Path::new(
                 "/opt/homebrew/Caskroom/../not-a-real-codex"
+            ))
+            .is_none()
+        );
+        // npm globals of a keg-only Node live inside the runtime's keg. Brew
+        // must never upgrade node@20 on behalf of the CLI installed with it.
+        assert!(
+            super::homebrew_package(std::path::Path::new(
+                "/opt/homebrew/Cellar/node@20/20.18.0/lib/node_modules/@openai/codex/bin/codex.js"
+            ))
+            .is_none()
+        );
+        assert!(
+            super::homebrew_package(std::path::Path::new(
+                "/usr/local/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12/bin/hermes"
+            ))
+            .is_none()
+        );
+        // Formulae that vendor a Node package keep it under libexec.
+        let gemini = super::homebrew_package(std::path::Path::new(
+            "/usr/local/Cellar/gemini-cli/0.9.0/libexec/lib/node_modules/@google/gemini-cli/dist/index.js",
+        ))
+        .unwrap();
+        assert_eq!(
+            gemini.upgrade_args(),
+            ["upgrade", "--formula", "gemini-cli"]
+        );
+        assert_eq!(gemini.brew, std::path::PathBuf::from("/usr/local/bin/brew"));
+        for unversioned in [
+            "/opt/homebrew/Caskroom/codex",
+            "/opt/homebrew/Cellar/codex/bin",
+        ] {
+            assert!(super::homebrew_package(std::path::Path::new(unversioned)).is_none());
+        }
+        // A leading dash would be read as a brew option.
+        assert!(
+            super::homebrew_package(std::path::Path::new(
+                "/opt/homebrew/Caskroom/--force/1.0.0/codex"
             ))
             .is_none()
         );

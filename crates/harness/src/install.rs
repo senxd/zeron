@@ -35,7 +35,7 @@ enum Method {
     Shell(&'static str, &'static str),
     Npm(&'static str, bool),
     PowerShell(&'static str),
-    Brew(&'static str),
+    Brew,
 }
 
 // Commands verified against these vendor pages with curl -fsSL on 2026-09-21.
@@ -61,11 +61,6 @@ fn methods(id: HarnessId, platform: Platform) -> Vec<Method> {
         )],
         Codex if windows => vec![
             PowerShell("irm https://chatgpt.com/codex/install.ps1 | iex"),
-            Npm("@openai/codex", false),
-        ],
-        Codex if platform == Platform::Mac => vec![
-            Brew("brew install --cask codex"),
-            Shell("curl -fsSL https://chatgpt.com/codex/install.sh | sh", "sh"),
             Npm("@openai/codex", false),
         ],
         Codex => vec![
@@ -102,7 +97,7 @@ fn methods(id: HarnessId, platform: Platform) -> Vec<Method> {
             "irm https://static.devin.ai/cli/setup.ps1 | iex",
         )],
         Devin if platform == Platform::Mac => vec![
-            Brew("brew install --cask devin-cli"),
+            Brew,
             Shell("curl -fsSL https://cli.devin.ai/install.sh | bash", "bash"),
         ],
         Devin => vec![Shell(
@@ -131,7 +126,7 @@ fn available(
         Method::Shell(_, shell) => has("sh") && has("curl") && has(shell),
         Method::Npm(..) => has("npm") && (platform == Platform::Windows || has("sh")),
         Method::PowerShell(_) => has("powershell"),
-        Method::Brew(_) => has("brew") && has("sh"),
+        Method::Brew => has("brew") && has("sh"),
     }
 }
 
@@ -284,7 +279,7 @@ fn command(method: Method) -> Result<Command, HarnessError> {
                 ""
             }
         ))?,
-        Method::Brew(script) => shell_command(script)?,
+        Method::Brew => shell_command("brew install --cask devin-cli")?,
         Method::Archive => unreachable!("archives have a separate executor"),
     };
     configure(&mut command);
@@ -426,20 +421,13 @@ mod tests {
                             }
                         }
                         Method::PowerShell(_) => assert_eq!(platform, Platform::Windows),
-                        Method::Brew(_) => assert_eq!(platform, Platform::Mac),
+                        Method::Brew => assert_eq!(platform, Platform::Mac),
                         _ => {}
                     }
                 }
             }
         }
-        assert_eq!(
-            methods(HarnessId::Devin, Platform::Mac)[0],
-            Method::Brew("brew install --cask devin-cli")
-        );
-        assert_eq!(
-            methods(HarnessId::Codex, Platform::Mac)[0],
-            Method::Brew("brew install --cask codex")
-        );
+        assert_eq!(methods(HarnessId::Devin, Platform::Mac)[0], Method::Brew);
         assert!(matches!(
             methods(HarnessId::Codex, Platform::Unix)[0],
             Method::Shell(_, "sh")
